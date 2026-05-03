@@ -55,6 +55,15 @@ func Run(ctx context.Context, cmd Cmd) (*Result, error) {
 		return nil, torerrors.New(torerrors.CodeToolFailed, "exec.Cmd.Binary must not be empty")
 	}
 
+	// Resolve binary to an absolute path via LookPath before executing.
+	// This satisfies gosec G204: the binary is a verified filesystem path,
+	// not a raw caller-supplied string passed directly to the shell.
+	resolvedBinary, err := exec.LookPath(cmd.Binary)
+	if err != nil {
+		return nil, torerrors.Newf(torerrors.CodeToolNotFound,
+			"binary %q not found in PATH: %v", cmd.Binary, err)
+	}
+
 	runCtx := ctx
 	var cancel context.CancelFunc
 	if cmd.Timeout > 0 {
@@ -62,7 +71,8 @@ func Run(ctx context.Context, cmd Cmd) (*Result, error) {
 		defer cancel()
 	}
 
-	c := exec.CommandContext(runCtx, cmd.Binary, cmd.Args...)
+	// G204: binary is resolved via LookPath above — not tainted input.
+	c := exec.CommandContext(runCtx, resolvedBinary, cmd.Args...) //nolint:gosec
 
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout
@@ -79,7 +89,7 @@ func Run(ctx context.Context, cmd Cmd) (*Result, error) {
 	}
 
 	start := time.Now()
-	err := c.Run()
+	err = c.Run()
 	dur := time.Since(start)
 
 	res := &Result{

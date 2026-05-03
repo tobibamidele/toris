@@ -45,7 +45,7 @@ func Write(dir string, m *model.BackupManifest) error {
 	}
 
 	path := filepath.Join(dir, manifestFilename)
-	if err := os.WriteFile(path, rawFinal, 0o640); err != nil {
+	if err := os.WriteFile(path, rawFinal, 0o600); err != nil {
 		return torerrors.Wrapf(torerrors.CodeStorageFailed, err,
 			"writing manifest to %s", path)
 	}

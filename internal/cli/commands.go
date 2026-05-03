@@ -127,7 +127,7 @@ timeouts:
   failover: "5m"
   tool_exec: "30m"
 `
-	if err := os.WriteFile(path, []byte(content), 0o640); err != nil {
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		return fmt.Errorf("writing starter config to %s: %w", path, err)
 	}
 	fmt.Printf("✓ Config written to %s\n", path)
@@ -191,18 +191,12 @@ func newClusterCmd() *cobra.Command {
 			log.Info("cluster status requested")
 			// TODO(impl): query control DB for cluster record.
 			// For now, print config-derived summary.
-			if cfg.OutputFormat == "json" {
-				printJSON(map[string]any{
-					"cluster_id": cfg.Cluster.ID,
-					"name":       cfg.Cluster.Name,
-					"nodes":      len(cfg.Cluster.Nodes),
-					"note":       "connect to control DB for live status; run 'toris daemon' first",
-				})
-			} else {
-				fmt.Printf("Cluster: %s (%s)\n", cfg.Cluster.Name, cfg.Cluster.ID)
-				fmt.Printf("Nodes:   %d configured\n", len(cfg.Cluster.Nodes))
-				fmt.Println("Run 'toris health' to see live node status.")
-			}
+			outputResult(cfg, map[string]any{
+				"cluster_id": cfg.Cluster.ID,
+				"name":       cfg.Cluster.Name,
+				"nodes":      len(cfg.Cluster.Nodes),
+				"note":       "connect to control DB for live status; run 'toris daemon' first",
+			})
 			return nil
 		},
 	})
@@ -224,12 +218,12 @@ func newNodeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if cfg.OutputFormat == "json" {
+			if cfg.OutputFormat == "json" || gFlags.outputFormat == "json" {
 				printJSON(cfg.Cluster.Nodes)
 			} else {
-				fmt.Printf("%-16s %-32s %-6s %s\n", "ID", "HOST", "PORT", "AUTH_PROFILE")
+				printHuman("%-16s %-32s %-6s %s", "ID", "HOST", "PORT", "AUTH_PROFILE")
 				for _, n := range cfg.Cluster.Nodes {
-					fmt.Printf("%-16s %-32s %-6d %s\n", n.ID, n.Host, n.Port, n.AuthProfile)
+					printHuman("%-16s %-32s %-6d %s", n.ID, n.Host, n.Port, n.AuthProfile)
 				}
 			}
 			return nil
