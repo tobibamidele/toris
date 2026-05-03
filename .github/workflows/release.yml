@@ -1,0 +1,204 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"
+
+permissions:
+  contents: write  # required to create GitHub releases and upload assets
+
+jobs:
+  # ── Build release binaries for all target platforms ─────────────────────────
+  build:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            suffix: linux_amd64
+          - goos: linux
+            goarch: arm64
+            suffix: linux_arm64
+          - goos: linux
+            goarch: "386"
+            suffix: linux_386
+          - goos: darwin
+            goarch: amd64
+            suffix: darwin_amd64
+          - goos: darwin
+            goarch: arm64
+            suffix: darwin_arm64
+          - goos: windows
+            goarch: amd64
+            suffix: windows_amd64
+            ext: .exe
+          - goos: freebsd
+            goarch: amd64
+            suffix: freebsd_amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history is required so git describe produces correct version strings.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve build metadata
+        id: meta
+        run: |
+          VERSION="${{ github.ref_name }}"
+          COMMIT=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "version=${VERSION}"    >> "$GITHUB_OUTPUT"
+          echo "commit=${COMMIT}"      >> "$GITHUB_OUTPUT"
+          echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
+
+      - name: Build binary
+        env:
+          GOOS:        ${{ matrix.goos }}
+          GOARCH:      ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+
+          BINARY="toris${{ matrix.ext }}"
+          ARCHIVE="toris_${{ steps.meta.outputs.version }}_${{ matrix.suffix }}"
+
+          go build \
+            -trimpath \
+            -ldflags "-s -w \
+              -X 'github.com/tobibamidele/toris/internal/cli.Version=${{ steps.meta.outputs.version }}' \
+              -X 'github.com/tobibamidele/toris/internal/cli.Commit=${{ steps.meta.outputs.commit }}' \
+              -X 'github.com/tobibamidele/toris/internal/cli.BuildDate=${{ steps.meta.outputs.build_date }}'" \
+            -o "dist/${BINARY}" \
+            ./cmd/toris
+
+          # Package as .tar.gz (Unix) or .zip (Windows)
+          cd dist
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip "${ARCHIVE}.zip" "${BINARY}"
+            echo "ASSET=${ARCHIVE}.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "${ARCHIVE}.tar.gz" "${BINARY}"
+            echo "ASSET=${ARCHIVE}.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.suffix }}
+          path: dist/${{ env.ASSET }}
+          retention-days: 1
+          if-no-files-found: error
+
+  # ── Compute SHA-256 checksums and publish the GitHub release ────────────────
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist/
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -lh dist/
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+          echo "--- checksums.txt ---"
+          cat checksums.txt
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          VERSION="${{ github.ref_name }}"
+
+          # Extract the section for this version from CHANGELOG.md.
+          # Format expected:
+          #   ## [v1.2.3] - 2026-05-02
+          #   ...content...
+          #   ## [v1.2.2] - ...
+          #
+          # If CHANGELOG.md is absent, fall back to a minimal note.
+          if [ -f CHANGELOG.md ]; then
+            # Print everything between this version header and the next ## header.
+            awk "/^## \[${VERSION}\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md \
+              > release_notes.md
+          fi
+
+          if [ ! -s release_notes.md ]; then
+            cat > release_notes.md <<EOF
+          Release ${VERSION}.
+
+          See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)
+          for the full change history.
+          EOF
+          fi
+
+          echo "--- release_notes.md ---"
+          cat release_notes.md
+
+      - name: Append asset table to release notes
+        run: |
+          VERSION="${{ github.ref_name }}"
+          cat >> release_notes.md <<'EOF'
+
+          ## Assets
+
+          | File | SHA-256 |
+          |------|---------|
+          EOF
+
+          while IFS= read -r line; do
+            HASH=$(echo "$line" | awk '{print $1}')
+            FILE=$(echo "$line" | awk '{print $2}')
+            echo "| \`${FILE}\` | \`${HASH}\` |" >> release_notes.md
+          done < dist/checksums.txt
+
+          echo "" >> release_notes.md
+          echo "The \`checksums.txt\` file is included in the release assets." >> release_notes.md
+
+      - name: Determine pre-release flag
+        id: prerelease
+        run: |
+          if echo "${{ github.ref_name }}" | grep -qE '\-rc\.[0-9]+$'; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:   ${{ github.ref_name }}
+          name:       ${{ github.ref_name }}
+          body_path:  release_notes.md
+          prerelease: ${{ steps.prerelease.outputs.is_prerelease }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt

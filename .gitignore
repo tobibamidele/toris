@@ -1,0 +1,31 @@
+# Compiled binaries
+bin/
+dist/
+
+# Test output
+coverage.out
+coverage.html
+
+# Local config files with real credentials — never commit these
+toris.yaml
+toris.yml
+*.local.yaml
+
+# Go module cache (when using vendor_src replace directives for local dev)
+# Do not commit vendor_src — it is a local-only workaround for restricted network envs.
+vendor_src/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Editor artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test artifacts
+/tmp/
+testdata/postgres/primary/data/
+testdata/postgres/replica*/data/

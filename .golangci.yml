@@ -1,0 +1,38 @@
+run:
+  timeout: 5m
+  modules-download-mode: mod
+
+linters:
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gofmt
+    - goimports
+    - revive
+    - gosec
+    - contextcheck
+    - noctx
+    - bodyclose
+
+linters-settings:
+  gosec:
+    excludes:
+      - G304  # file path from variable — intentional in backup/restore paths
+  revive:
+    rules:
+      - name: exported
+        disabled: false
+      - name: var-naming
+        disabled: false
+
+issues:
+  exclude-rules:
+    # Test files are allowed to use fmt.Println and have less strict gosec.
+    - path: "_test.go"
+      linters:
+        - gosec
+        - errcheck
