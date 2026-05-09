@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/tobibamidele/toris/internal/app"
 	"github.com/tobibamidele/toris/internal/backup"
 	"github.com/tobibamidele/toris/internal/config"
 	pgback "github.com/tobibamidele/toris/internal/db/postgres"
@@ -715,23 +716,19 @@ func newDaemonCmd() *cobra.Command {
   - Runs health checks on a schedule
   - Manages automatic failover (if enabled)
   - Serves the stable proxy endpoint
-  - Exposes metrics
+  - Exposes Prometheus metrics
 
-Press Ctrl-C to initiate graceful shutdown.`,
+Press Ctrl-C or send SIGTERM for graceful shutdown.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, log, err := loadConfig()
 			if err != nil {
 				return err
 			}
-			log.Info("toris daemon starting",
-				"instance_id", cfg.InstanceID,
-				"cluster_id", cfg.Cluster.ID,
-			)
-			fmt.Println("⚙  Daemon started (see logs for details)")
-			fmt.Println("  Ctrl-C to stop")
-			// TODO(impl): wire up app.App.Run()
-			// Block until signal.
-			select {}
+			a, err := app.New(cfg, log)
+			if err != nil {
+				return fmt.Errorf("daemon init failed: %w", err)
+			}
+			return a.Run()
 		},
 	}
 }
