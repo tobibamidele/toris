@@ -49,6 +49,29 @@ import (
 	"github.com/tobibamidele/toris/pkg/model"
 )
 
+// Rewinder is the interface the failover engine uses to schedule post-failover
+// rewind or reseed. Implemented by restore.Rewinder.
+type Rewinder interface {
+	RewindOrReseed(ctx context.Context, opts RewindOptions) (*model.RewindJob, error)
+}
+
+// RewindOptions is passed from the failover engine to the Rewinder.
+// Kept here to avoid an import cycle between failover and restore.
+type RewindOptions struct {
+	OldPrimary         *model.Node
+	NewPrimary         *model.Node
+	OldPrimaryDataDir  string
+	NewPrimaryDSN      string
+	NewPrimaryPassword string
+	FallbackBackupID   string
+	FallbackTargetDir  string
+	TempDir            string
+	ClusterID          string
+	Generation         int64
+	RewindTimeout      time.Duration
+	ReseedTimeout      time.Duration
+}
+
 // Engine evaluates cluster health snapshots and executes failover when warranted.
 type Engine struct {
 	log        *logging.Logger
@@ -62,23 +85,27 @@ type Engine struct {
 	auditor  *audit.Writer
 	tracker  *health.Tracker
 	metrics  *telemetry.Metrics
+	rewinder Rewinder // nil when auto-rewind is disabled
 
 	// config thresholds
-	unhealthyThreshold time.Duration
-	maxLagBytes        int64
-	failoverEnabled    bool
+	unhealthyThreshold      time.Duration
+	maxLagBytes             int64
+	failoverEnabled         bool
+	autoRewindAfterFailover bool
 }
 
 // Config holds all threshold values the Engine needs.
 type Config struct {
-	ClusterID          string
-	InstanceID         string
-	UnhealthyThreshold time.Duration
-	MaxLagBytes        int64
-	FailoverEnabled    bool
+	ClusterID               string
+	InstanceID              string
+	UnhealthyThreshold      time.Duration
+	MaxLagBytes             int64
+	FailoverEnabled         bool
+	AutoRewindAfterFailover bool
 }
 
 // New creates a failover Engine.
+// rewinder may be nil to disable automatic post-failover rewind scheduling.
 func New(
 	log *logging.Logger,
 	cfg Config,
@@ -89,21 +116,24 @@ func New(
 	auditor *audit.Writer,
 	tracker *health.Tracker,
 	metrics *telemetry.Metrics,
+	rewinder Rewinder,
 ) *Engine {
 	return &Engine{
-		log:                log,
-		clusterID:          cfg.ClusterID,
-		instanceID:         cfg.InstanceID,
-		registry:           registry,
-		lm:                 lm,
-		backend:            backend,
-		proxy:              proxy,
-		auditor:            auditor,
-		tracker:            tracker,
-		metrics:            metrics,
-		unhealthyThreshold: cfg.UnhealthyThreshold,
-		maxLagBytes:        cfg.MaxLagBytes,
-		failoverEnabled:    cfg.FailoverEnabled,
+		log:                     log,
+		clusterID:               cfg.ClusterID,
+		instanceID:              cfg.InstanceID,
+		registry:                registry,
+		lm:                      lm,
+		backend:                 backend,
+		proxy:                   proxy,
+		auditor:                 auditor,
+		tracker:                 tracker,
+		metrics:                 metrics,
+		rewinder:                rewinder,
+		unhealthyThreshold:      cfg.UnhealthyThreshold,
+		maxLagBytes:             cfg.MaxLagBytes,
+		failoverEnabled:         cfg.FailoverEnabled,
+		autoRewindAfterFailover: cfg.AutoRewindAfterFailover,
 	}
 }
 
@@ -309,7 +339,59 @@ func (e *Engine) execute(ctx context.Context, oldPrimary *model.Node, snapshots 
 		"duration", util.FormatDuration(time.Since(start)),
 		"generation", generation,
 	)
+
+	// 8. Schedule post-failover rewind/reseed asynchronously.
+	// This runs in a goroutine so it does not block the health loop.
+	// The old primary remains fenced until rewind succeeds.
+	if e.autoRewindAfterFailover && e.rewinder != nil {
+		go e.scheduleRewind(oldPrimary, candidate, generation)
+	}
+
 	return nil
+}
+
+// scheduleRewind runs pg_rewind (or reseed fallback) on the old primary
+// in a background goroutine after failover completes.
+func (e *Engine) scheduleRewind(oldPrimary, newPrimary *model.Node, generation int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
+	defer cancel()
+
+	e.log.Info("scheduling post-failover rewind",
+		"old_primary", oldPrimary.ID,
+		"new_primary", newPrimary.ID,
+	)
+
+	job, err := e.rewinder.RewindOrReseed(ctx, RewindOptions{
+		OldPrimary:    oldPrimary,
+		NewPrimary:    newPrimary,
+		ClusterID:     e.clusterID,
+		Generation:    generation,
+		RewindTimeout: 30 * time.Minute,
+		ReseedTimeout: 6 * time.Hour,
+	})
+
+	if err != nil {
+		e.log.Error("post-failover rewind/reseed failed — old primary remains fenced",
+			"old_primary", oldPrimary.ID,
+			"error", err.Error(),
+		)
+		return
+	}
+
+	status := "rewound"
+	if job.UsedFallback {
+		status = "reseeded (pg_rewind fallback)"
+	}
+	e.log.Info("post-failover rewind complete",
+		"old_primary", oldPrimary.ID,
+		"status", status,
+		"duration", util.FormatDuration(job.FinishedAt.Sub(job.StartedAt)),
+	)
+	// Update the node status so the health loop can re-evaluate it.
+	updateCtx, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	_ = e.registry.UpdateStatus(updateCtx, oldPrimary.ID,
+		model.NodeStatusJoining, model.NodeRoleReplica, 0)
 }
 
 // fenceOldPrimary forces the old primary read-only and terminates its

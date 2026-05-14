@@ -366,3 +366,45 @@ type AuditEvent struct {
 	Metadata   map[string]string `json:"metadata,omitempty"`
 	OccurredAt time.Time         `json:"occurred_at"`
 }
+
+// ─── Restore modes ────────────────────────────────────────────────────────────
+
+// RestoreMode distinguishes what kind of restore operation is being performed.
+type RestoreMode string
+
+const (
+	// RestoreModeEmptyNode restores into a clean, empty data directory.
+	RestoreModeEmptyNode RestoreMode = "empty_node"
+	// RestoreModeReplacement restores to replace a failed node in the cluster.
+	RestoreModeReplacement RestoreMode = "replacement"
+	// RestoreModeRehearsal restores into a temp directory for verification only.
+	RestoreModeRehearsal RestoreMode = "rehearsal"
+	// RestoreModeReseed restores to reseed a replica from the latest backup.
+	RestoreModeReseed RestoreMode = "reseed"
+)
+
+// RewindStatus tracks a post-failover pg_rewind or reseed operation.
+type RewindStatus string
+
+const (
+	RewindStatusPending   RewindStatus = "pending"
+	RewindStatusRunning   RewindStatus = "running"
+	RewindStatusCompleted RewindStatus = "completed"
+	RewindStatusFailed    RewindStatus = "failed"
+	// RewindStatusFallback means pg_rewind failed and a full reseed was used instead.
+	RewindStatusFallback RewindStatus = "fallback_reseed"
+)
+
+// RewindJob tracks a single post-failover rewind or reseed attempt for an old primary.
+type RewindJob struct {
+	ID           string       `json:"id"`
+	ClusterID    string       `json:"cluster_id"`
+	NodeID       string       `json:"node_id"` // old primary being rewound
+	NewPrimaryID string       `json:"new_primary_id"`
+	Generation   int64        `json:"generation"`
+	Status       RewindStatus `json:"status"`
+	UsedFallback bool         `json:"used_fallback"` // true if reseed was used instead of rewind
+	StartedAt    time.Time    `json:"started_at"`
+	FinishedAt   *time.Time   `json:"finished_at,omitempty"`
+	FailureMsg   string       `json:"failure_msg,omitempty"`
+}

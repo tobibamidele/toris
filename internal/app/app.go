@@ -46,6 +46,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/tobibamidele/toris/internal/audit"
+	"github.com/tobibamidele/toris/internal/backup"
 	"github.com/tobibamidele/toris/internal/cluster"
 	"github.com/tobibamidele/toris/internal/config"
 	"github.com/tobibamidele/toris/internal/db/postgres"
@@ -53,7 +54,11 @@ import (
 	"github.com/tobibamidele/toris/internal/health"
 	"github.com/tobibamidele/toris/internal/leader"
 	"github.com/tobibamidele/toris/internal/logging"
+	"github.com/tobibamidele/toris/internal/restore"
+	"github.com/tobibamidele/toris/internal/retention"
 	"github.com/tobibamidele/toris/internal/routing"
+	"github.com/tobibamidele/toris/internal/storage"
+	fsstorage "github.com/tobibamidele/toris/internal/storage/fs"
 	"github.com/tobibamidele/toris/internal/telemetry"
 	"github.com/tobibamidele/toris/internal/util"
 	"github.com/tobibamidele/toris/pkg/model"
@@ -77,6 +82,10 @@ type App struct {
 	proxy       *routing.Proxy
 	auditor     *audit.Writer
 	tracker     *health.Tracker
+	store       storage.Backend
+	backupPL    *backup.Pipeline
+	rewinder    *restore.Rewinder
+	enforcer    *retention.Enforcer
 	engine      *failover.Engine
 }
 
@@ -129,15 +138,38 @@ func New(cfg *config.Config, log *logging.Logger) (*App, error) {
 		a.proxy = routing.NewProxy(log, cfg.Proxy.ListenAddr, cfg.Proxy.DialTimeout)
 	}
 
+	// ── Storage backend ────────────────────────────────────────────────────
+	store, err := fsstorage.New(cfg.Backup.BaseDir)
+	if err != nil {
+		return nil, fmt.Errorf("initialising storage backend: %w", err)
+	}
+	a.store = store
+
+	// ── Retention enforcer ─────────────────────────────────────────────────
+	a.enforcer = retention.New(log, a.store, model.RetentionPolicy{
+		MinCount:   cfg.Backup.Retention.MinCount,
+		MaxAgeDays: cfg.Backup.Retention.MaxAgeDays,
+		KeepFailed: cfg.Backup.Retention.KeepFailed,
+	})
+
+	// ── Backup pipeline ────────────────────────────────────────────────────
+	// Tools checked lazily at daemon startup; nil here and resolved on first use.
+	a.backupPL = backup.NewPipeline(log, a.lm, nil, a.store, a.enforcer)
+
+	// ── Rewinder ───────────────────────────────────────────────────────────
+	// Tools resolved at bootstrap; for now set nil until CheckTools runs.
+	a.rewinder = restore.NewRewinder(log, nil, a.store)
+
 	// ── Failover engine ───────────────────────────────────────────────────
 	a.engine = failover.New(
 		log,
 		failover.Config{
-			ClusterID:          cfg.Cluster.ID,
-			InstanceID:         cfg.InstanceID,
-			UnhealthyThreshold: cfg.Failover.UnhealthyThreshold,
-			MaxLagBytes:        cfg.Failover.MaxReplicationLagBytes,
-			FailoverEnabled:    cfg.Failover.Enabled,
+			ClusterID:               cfg.Cluster.ID,
+			InstanceID:              cfg.InstanceID,
+			UnhealthyThreshold:      cfg.Failover.UnhealthyThreshold,
+			MaxLagBytes:             cfg.Failover.MaxReplicationLagBytes,
+			FailoverEnabled:         cfg.Failover.Enabled,
+			AutoRewindAfterFailover: cfg.Failover.AutoRewindAfterFailover,
 		},
 		a.registry,
 		a.lm,
@@ -146,6 +178,7 @@ func New(cfg *config.Config, log *logging.Logger) (*App, error) {
 		a.auditor,
 		a.tracker,
 		a.metrics,
+		nil, // rewinder injected after tool check at bootstrap
 	)
 
 	return a, nil

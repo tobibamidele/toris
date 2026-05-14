@@ -10,6 +10,130 @@ Release candidates are tagged as `vMAJOR.MINOR.PATCH-rc.N`.
 
 ---
 
+## [v0.3.0] - 2026-05-13
+
+### Added
+
+- `internal/storage/storage.go` — `Backend` interface with `Write`, `Read`,
+  `Delete`, `List`, `Stat`, and `Name`. All storage operations accept a context.
+  `ObjectInfo` carries key, size, last-modified, and content hash.
+
+- `internal/storage/fs/fs.go` — Filesystem `Backend` implementation. Writes are
+  atomic: data is written to a hidden temp file in the same directory, synced to
+  disk, then renamed into place. `rename(2)` on POSIX is atomic within a mount
+  point so readers never see a partial write. Path traversal attempts are silently
+  redirected to an invalid path that fails on open. Helper functions `KeyForBackup`
+  and `BackupPrefix` provide canonical key conventions for backup artifacts.
+  `WriteFile` and `ReadFile` convenience helpers bridge local paths and the backend.
+
+- `internal/storage/s3/s3.go` — S3 `Backend` implementation using AWS SDK v2,
+  compiled only with `-tags s3`. Objects below 100 MB use `PutObject`; larger
+  objects use the multipart upload API with 64 MB parts and automatic abort on
+  part failure. `UsePathStyle` is set for MinIO/Localstack compatibility.
+
+- `internal/storage/s3/s3_stub.go` — Stub compiled without `-tags s3` that
+  returns a clear error on every call, directing operators to rebuild with
+  `-tags s3` to enable S3 storage. Prevents accidental silent no-ops.
+
+- `internal/restore/restore.go` — Full restore pipeline: (1) fetch and verify
+  manifest self-hash from storage, (2) download and SHA-256-verify every artifact,
+  (3) extract tar/tar.gz archives with path-traversal protection, (4) write
+  `standby.signal` for reseed mode, (5) clean up rehearsal staging directories.
+  A restore is never marked complete if any step fails. Failed jobs preserve their
+  `ArtifactDir` for forensic inspection.
+
+- `internal/restore/reseed.go` — `Reseeder` wraps the restore engine for the
+  specific case of reseeding a replica: calls `Run` in `RestoreModeReseed` and
+  validates that both `BackupID` and `TargetDir` are supplied before starting.
+
+- `internal/restore/rewind.go` — `Rewinder` attempts `pg_rewind` on a demoted
+  old primary using the existing `PgRewind` tool wrapper. If `pg_rewind` fails
+  and `FallbackBackupID` is set, it falls back to a full reseed via `Reseeder`.
+  The `RewindJob` record captures whether rewind or the fallback path was used.
+
+- `internal/retention/policy.go` — Production `Enforcer` that calls
+  `Classify` and deletes prunable backup artifacts from the storage backend via
+  `store.List` + `store.Delete`. Logs each pruned backup with its age. Failed
+  deletes are logged and skipped so a single bad artifact cannot abort the entire
+  retention run.
+
+- `internal/retention/policy.go` — `Classify` function (production code,
+  previously only present as a test helper): sort verified backups oldest-first,
+  keep the newest `MinCount` unconditionally, prune older ones beyond `MaxAgeDays`,
+  honour `KeepFailed`, and always keep pending/running backups.
+
+- `internal/failover/failover.go` — `Rewinder` interface and `RewindOptions`
+  type defined in this package to avoid an import cycle with `internal/restore`.
+  `Engine` gains a `rewinder` field and `autoRewindAfterFailover` flag. After a
+  successful failover, `scheduleRewind` runs in a background goroutine, calls
+  `RewindOrReseed`, and updates the old primary's registry status to `joining`
+  on success so the health loop can re-evaluate it.
+
+- `internal/config/config.go` — `FailoverConfig.ReplicationOutageThreshold`
+  (default 5 minutes) and `FailoverConfig.AutoRewindAfterFailover` (default
+  true). `RestoreConfig.DataDir` field for explicit data directory override.
+
+- `pkg/model/model.go` — `RestoreMode` enum (`empty_node`, `replacement`,
+  `rehearsal`, `reseed`). `RewindJob` model with `RewindStatus` enum
+  (`pending`, `running`, `completed`, `failed`, `fallback_reseed`) and
+  `UsedFallback` field.
+
+### Changed
+
+- `internal/backup/pipeline.go` — Rewrote to inject `storage.Backend` and
+  `retention.Enforcer`. Staging directory is now `StagingDir/<backupID>` (was
+  `BackupBaseDir/<backupID>`). After `pg_verifybackup` passes, artifacts are
+  uploaded to the storage backend. If `offsite_required` is false and upload
+  fails, the backup is retained locally with a warning. `Prune` method added
+  to invoke the retention enforcer. `BackupBaseDir` field replaced with
+  `StagingDir` and `ClusterID`.
+
+- `internal/app/app.go` — Wired `fsstorage.Backend`, `retention.Enforcer`,
+  `backup.Pipeline`, and `restore.Rewinder` into the dependency graph. Daemon
+  now initialises the storage backend at startup and injects it into the backup
+  pipeline and rewinder.
+
+- `internal/cli/commands.go` — Removed all TODO stubs for the following
+  commands; all are now fully implemented:
+  - `toris backup list` — queries the storage backend for backup IDs.
+  - `toris restore` — calls `restore.Engine.Run` with `RestoreModeEmptyNode`.
+  - `toris leader status` — opens a control DB connection and calls
+    `leader.Manager.Status`; prints generation, expiry, and an EXPIRED flag.
+  - `toris leader acquire` — calls `leader.Manager.Acquire` and prints the
+    resulting lease with generation and expiry.
+  - `toris leader release` — calls `leader.Manager.Release` with confirmation
+    prompt unless `--force`.
+  - `toris backup create` — now injects a real `fsstorage.Backend` rather than
+    passing `nil`; the lease manager is still `nil` in CLI mode (documented).
+  - `connectControlDB` helper opens and pings a pgxpool connection.
+  - `splitKey` helper splits storage keys on `/`.
+  - `restoreEngine` and `restoreOptions` helpers bridge CLI args and the restore
+    package.
+
+### Tests added
+
+- `internal/storage/fs/fs_test.go` — 16 tests: write/read round-trip, large
+  payload (5 MB), atomic write leaves no temp files, overwrite is atomic, read
+  not-found error, delete removes object, delete non-existent is no error, list
+  returns all keys, list filters by prefix, list on empty dir, list is sorted,
+  stat returns size, stat not-found, path traversal is safe, KeyForBackup,
+  BackupPrefix, canceled context on Write and Read.
+
+- `internal/restore/restore_test.go` — 10 tests: rehearsal mode completes,
+  empty-node mode completes, reseed mode writes `standby.signal`, missing backup
+  returns failed job, failed job preserves ArtifactDir, job ID always set,
+  canceled context, reseeder missing BackupID error, reseeder missing TargetDir
+  error. Tests use a `writeFakeTarGz` helper that produces a real gzip+tar
+  archive so the extraction stage executes genuine decompression code.
+
+- `internal/retention/retention_test.go` — 10 tests: below MinCount keeps all,
+  exactly at MinCount keeps all, prunes old beyond MinCount, newest MinCount
+  always kept, keeps failed when KeepFailed=true, prunes failed when false,
+  zero MaxAgeDays disables age pruning, pending/running always kept, uploaded
+  status counts as verified for pruning purposes, single backup never pruned.
+
+---
+
 ## [v0.2.0] - 2026-05-04
 
 ### Added
@@ -175,14 +299,3 @@ Release candidates are tagged as `vMAJOR.MINOR.PATCH-rc.N`.
 - Demoted nodes are forced into `default_transaction_read_only = on` before
   the routing target is switched.
 
-### Not yet implemented (planned for v0.2.0)
-
-- `internal/app/app.go` daemon wiring and signal handling
-- `internal/failover` decision engine (threshold-based, lease-aware)
-- `internal/restore` restore and reseed pipelines
-- `internal/cluster` node registry backed by the control database
-- `internal/audit` append-only audit event writer
-- `internal/telemetry` Prometheus metrics exposition
-- Integration test suite using testcontainers-go
-- Automatic `pg_rewind` after failover
-- Offsite backup copy (S3 backend)

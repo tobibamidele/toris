@@ -6,12 +6,18 @@ import (
 	"os"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/spf13/cobra"
 
 	"github.com/tobibamidele/toris/internal/app"
 	"github.com/tobibamidele/toris/internal/backup"
 	"github.com/tobibamidele/toris/internal/config"
 	pgback "github.com/tobibamidele/toris/internal/db/postgres"
+	"github.com/tobibamidele/toris/internal/leader"
+	"github.com/tobibamidele/toris/internal/logging"
+	"github.com/tobibamidele/toris/internal/restore"
+	"github.com/tobibamidele/toris/internal/storage"
+	fsstorage "github.com/tobibamidele/toris/internal/storage/fs"
 	"github.com/tobibamidele/toris/internal/util"
 	"github.com/tobibamidele/toris/pkg/model"
 )
@@ -358,16 +364,18 @@ func newBackupCmd() *cobra.Command {
 			// Resolve auth profile.
 			replicationUser, replicationPass := resolveAuth(cfg, nc.AuthProfile)
 
-			// Leader manager is needed by the pipeline; for CLI invocations outside
-			// daemon mode, we use a no-lease pipeline with a nil manager.
-			// TODO(v2): enforce lease requirement for CLI backup too.
-			_ = replicationUser
-
-			pl := backup.NewPipeline(log, nil, tools)
+			// CLI backup: no lease manager (outside daemon mode).
+			store, storeErr := fsstorage.New(cfg.Backup.BaseDir)
+			if storeErr != nil {
+				return fmt.Errorf("initialising storage: %w", storeErr)
+			}
+			pl := backup.NewPipeline(log, nil, tools, store, nil)
 			b, err := pl.Create(ctx, backup.CreateOptions{
 				Node:                node,
-				BackupBaseDir:       cfg.Backup.BaseDir,
+				ClusterID:           cfg.Cluster.ID,
+				StagingDir:          cfg.Backup.BaseDir,
 				DryRun:              gFlags.dryRun,
+				OffSiteRequired:     cfg.Backup.OffSiteRequired,
 				BackupTimeout:       cfg.Timeouts.Backup,
 				VerifyTimeout:       cfg.Timeouts.ToolExec,
 				ReplicationUser:     replicationUser,
@@ -471,22 +479,56 @@ func newRestoreCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "restore",
 		Short: "Restore a backup to a node",
+		Long: `Restores a verified backup into a target data directory.
+The target directory must be empty. PostgreSQL must not be running on it.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if backupID == "" {
 				return fmt.Errorf("--backup-id is required")
 			}
-			_, log, err := loadConfig()
+			if targetDir == "" {
+				return fmt.Errorf("--target-dir is required")
+			}
+			cfg, log, err := loadConfig()
 			if err != nil {
 				return err
 			}
-			log.Info("restore requested", "backup_id", backupID, "target_dir", targetDir)
-			fmt.Printf("⚙  Restoring backup %s to %s...\n", backupID, targetDir)
-			fmt.Println("  (restore implementation: see internal/restore package)")
+			if !gFlags.force {
+				ok, _ := confirmDestructive(
+					fmt.Sprintf("restore backup %s into %s?", backupID, targetDir))
+				if !ok {
+					fmt.Println("aborted")
+					return nil
+				}
+			}
+			store, storeErr := fsstorage.New(cfg.Backup.BaseDir)
+			if storeErr != nil {
+				return fmt.Errorf("opening storage: %w", storeErr)
+			}
+			engine := restoreEngine(log, store)
+			ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeouts.Restore)
+			defer cancel()
+			job, jobErr := engine.Run(ctx, restoreOptions(backupID, targetDir, cfg))
+			if jobErr != nil {
+				if job != nil {
+					log.Error("restore failed", "job_id", job.ID, "artifact_dir", job.ArtifactDir)
+				}
+				return jobErr
+			}
+			if cfg.OutputFormat == "json" || gFlags.outputFormat == "json" {
+				printJSON(job)
+			} else {
+				fmt.Printf("Restore complete\n")
+				fmt.Printf("  Job     : %s\n", job.ID)
+				fmt.Printf("  Status  : %s\n", string(job.Status))
+				if job.FinishedAt != nil {
+					fmt.Printf("  Duration: %s\n", util.FormatDuration(job.FinishedAt.Sub(job.StartedAt)))
+				}
+			}
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&backupID, "backup-id", "", "ID of the backup to restore (required)")
-	cmd.Flags().StringVar(&targetDir, "target-dir", "", "directory to restore into")
+	cmd.Flags().StringVar(&targetDir, "target-dir", "", "target PostgreSQL data directory (required)")
 	return cmd
 }
 
@@ -532,11 +574,37 @@ func newLeaderCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				log.Info("leader status requested")
-				// TODO: connect to control DB and query lease.
-				fmt.Printf("Cluster: %s\n", cfg.Cluster.ID)
-				fmt.Println("Connect to the control DB to see the current lease holder.")
-				fmt.Println("(Run 'toris daemon' so that lease state is maintained.)")
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				pool, poolErr := connectControlDB(ctx, cfg.ControlDSN)
+				if poolErr != nil {
+					return fmt.Errorf("connecting to control DB: %w", poolErr)
+				}
+				defer pool.Close()
+				lm := leader.New(log, pool, cfg.Cluster.ID, cfg.InstanceID,
+					cfg.Leader.LeaseTTL, cfg.Leader.RenewInterval)
+				lease, leaseErr := lm.Status(ctx)
+				if leaseErr != nil {
+					if cfg.OutputFormat == "json" || gFlags.outputFormat == "json" {
+						printJSON(map[string]string{"status": "no_lease", "cluster_id": cfg.Cluster.ID})
+					} else {
+						fmt.Printf("Cluster %s: no active lease record found.\n", cfg.Cluster.ID)
+					}
+					return nil
+				}
+				if cfg.OutputFormat == "json" || gFlags.outputFormat == "json" {
+					printJSON(lease)
+				} else {
+					fmt.Printf("Cluster    : %s\n", lease.ClusterID)
+					fmt.Printf("Leader     : %s\n", lease.LeaderID)
+					fmt.Printf("Instance   : %s\n", lease.InstanceID)
+					fmt.Printf("Generation : %d\n", lease.Generation)
+					fmt.Printf("Status     : %s\n", lease.Status)
+					fmt.Printf("Expires    : %s\n", lease.ExpiresAt.Format(time.RFC3339))
+					if lease.IsExpired(time.Now()) {
+						fmt.Println("           (EXPIRED)")
+					}
+				}
 				return nil
 			},
 		},
@@ -544,13 +612,29 @@ func newLeaderCmd() *cobra.Command {
 			Use:   "acquire",
 			Short: "Manually attempt to acquire the cluster lease",
 			RunE: func(cmd *cobra.Command, args []string) error {
-				_, log, err := loadConfig()
+				cfg, log, err := loadConfig()
 				if err != nil {
 					return err
 				}
-				log.Info("manual lease acquisition requested")
-				fmt.Println("⚙  Attempting lease acquisition...")
-				// TODO: wire up leader.Manager.
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				pool, poolErr := connectControlDB(ctx, cfg.ControlDSN)
+				if poolErr != nil {
+					return fmt.Errorf("connecting to control DB: %w", poolErr)
+				}
+				defer pool.Close()
+				lm := leader.New(log, pool, cfg.Cluster.ID, cfg.InstanceID,
+					cfg.Leader.LeaseTTL, cfg.Leader.RenewInterval)
+				lease, leaseErr := lm.Acquire(ctx)
+				if leaseErr != nil {
+					return fmt.Errorf("lease acquisition failed: %w", leaseErr)
+				}
+				if cfg.OutputFormat == "json" || gFlags.outputFormat == "json" {
+					printJSON(lease)
+				} else {
+					fmt.Printf("Lease acquired (generation %d, expires %s)\n",
+						lease.Generation, lease.ExpiresAt.Format(time.RFC3339))
+				}
 				return nil
 			},
 		},
@@ -558,7 +642,7 @@ func newLeaderCmd() *cobra.Command {
 			Use:   "release",
 			Short: "Release the cluster lease (if held by this instance)",
 			RunE: func(cmd *cobra.Command, args []string) error {
-				_, log, err := loadConfig()
+				cfg, log, err := loadConfig()
 				if err != nil {
 					return err
 				}
@@ -569,8 +653,19 @@ func newLeaderCmd() *cobra.Command {
 						return nil
 					}
 				}
-				log.Info("manual lease release requested")
-				fmt.Println("⚙  Releasing lease...")
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				pool, poolErr := connectControlDB(ctx, cfg.ControlDSN)
+				if poolErr != nil {
+					return fmt.Errorf("connecting to control DB: %w", poolErr)
+				}
+				defer pool.Close()
+				lm := leader.New(log, pool, cfg.Cluster.ID, cfg.InstanceID,
+					cfg.Leader.LeaseTTL, cfg.Leader.RenewInterval)
+				if releaseErr := lm.Release(ctx); releaseErr != nil {
+					return fmt.Errorf("lease release failed: %w", releaseErr)
+				}
+				fmt.Println("Lease released.")
 				return nil
 			},
 		},
@@ -840,4 +935,57 @@ func formatBytes(b int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// ─── Shared CLI helpers ───────────────────────────────────────────────────────
+
+// connectControlDB opens a pgxpool connection to the toris control database.
+func connectControlDB(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+	if dsn == "" {
+		return nil, fmt.Errorf("control_dsn is not configured; set it in toris.yaml or TORIS_CONTROL_DSN")
+	}
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("creating control DB pool: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("pinging control DB: %w", err)
+	}
+	return pool, nil
+}
+
+// splitKey splits a storage key on "/" returning the parts.
+func splitKey(key string) []string {
+	var parts []string
+	start := 0
+	for i := 0; i < len(key); i++ {
+		if key[i] == '/' {
+			if i > start {
+				parts = append(parts, key[start:i])
+			}
+			start = i + 1
+		}
+	}
+	if start < len(key) {
+		parts = append(parts, key[start:])
+	}
+	return parts
+}
+
+// restoreEngine builds a restore.Engine from a log and storage backend.
+func restoreEngine(log *logging.Logger, store storage.Backend) *restore.Engine {
+	return restore.New(log, store)
+}
+
+// restoreOptions builds restore.Options from CLI args and config.
+func restoreOptions(backupID, targetDir string, cfg *config.Config) restore.Options {
+	return restore.Options{
+		BackupID:  backupID,
+		TargetDir: targetDir,
+		Mode:      model.RestoreModeEmptyNode,
+		TempDir:   cfg.Restore.TempDir,
+		Timeout:   cfg.Timeouts.Restore,
+		ClusterID: cfg.Cluster.ID,
+	}
 }
