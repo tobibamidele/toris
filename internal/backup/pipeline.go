@@ -1,8 +1,9 @@
 // Package backup implements the full backup pipeline:
-// preflight → snapshot → manifest → verification → retention → offsite.
+// preflight → snapshot → manifest → verification → storage upload → retention.
 //
 // A backup is not marked successful until pg_verifybackup passes.
-// A backup is not uploaded/complete until the offsite copy is confirmed (if enabled).
+// A backup is not marked uploaded until all artifacts are in the storage backend.
+// A backup is not marked complete if offsite_required is true and the upload fails.
 package backup
 
 import (
@@ -17,53 +18,60 @@ import (
 	"github.com/tobibamidele/toris/internal/leader"
 	"github.com/tobibamidele/toris/internal/logging"
 	"github.com/tobibamidele/toris/internal/manifest"
+	"github.com/tobibamidele/toris/internal/retention"
+	"github.com/tobibamidele/toris/internal/storage"
+	"github.com/tobibamidele/toris/internal/storage/fs"
 	"github.com/tobibamidele/toris/internal/util"
 	"github.com/tobibamidele/toris/pkg/model"
 )
 
 // CreateOptions configures a single backup run.
 type CreateOptions struct {
-	// Node is the source PostgreSQL node to back up.
-	Node *model.Node
-	// BackupBaseDir is the root directory for backup storage.
-	BackupBaseDir string
-	// Label is embedded in the PostgreSQL backup label.
-	Label string
-	// DryRun: perform preflight checks only, no actual backup.
-	DryRun bool
-	// BackupTimeout overrides the default backup timeout.
-	BackupTimeout time.Duration
-	// VerifyTimeout overrides the default verify timeout.
-	VerifyTimeout time.Duration
-	// ReplicationUser for pg_basebackup connection.
-	ReplicationUser string
-	// ReplicationPassword — never logged.
+	Node                *model.Node
+	ClusterID           string
+	StagingDir          string
+	Label               string
+	DryRun              bool
+	OffSiteRequired     bool
+	BackupTimeout       time.Duration
+	VerifyTimeout       time.Duration
+	ReplicationUser     string
 	ReplicationPassword string
-	// PostgresVersion string (e.g. "PostgreSQL 15.3") for the manifest.
-	PostgresVersion string
+	PostgresVersion     string
 }
 
 // Pipeline orchestrates the full backup lifecycle.
 type Pipeline struct {
-	log   *logging.Logger
-	lm    *leader.Manager
-	tools *pgtools.Tools
+	log      *logging.Logger
+	lm       *leader.Manager
+	tools    *pgtools.Tools
+	store    storage.Backend
+	enforcer *retention.Enforcer
 }
 
 // NewPipeline creates a backup Pipeline.
-func NewPipeline(log *logging.Logger, lm *leader.Manager, tools *pgtools.Tools) *Pipeline {
-	return &Pipeline{log: log, lm: lm, tools: tools}
+// lm may be nil when invoked from the CLI outside daemon mode.
+func NewPipeline(
+	log *logging.Logger,
+	lm *leader.Manager,
+	tools *pgtools.Tools,
+	store storage.Backend,
+	enforcer *retention.Enforcer,
+) *Pipeline {
+	return &Pipeline{log: log, lm: lm, tools: tools, store: store, enforcer: enforcer}
 }
 
 // Create runs the full backup pipeline and returns the completed Backup record.
-// The caller is responsible for persisting the returned Backup to their store.
 func (p *Pipeline) Create(ctx context.Context, opts CreateOptions) (*model.Backup, error) {
 	backupID := util.NewID()
-	generation := p.lm.CurrentGeneration()
+	var generation int64
+	if p.lm != nil {
+		generation = p.lm.CurrentGeneration()
+	}
 
 	backup := &model.Backup{
 		ID:         backupID,
-		ClusterID:  "", // set by caller who knows cluster context
+		ClusterID:  opts.ClusterID,
 		NodeID:     opts.Node.ID,
 		Generation: generation,
 		Status:     model.BackupStatusPending,
@@ -76,7 +84,7 @@ func (p *Pipeline) Create(ctx context.Context, opts CreateOptions) (*model.Backu
 		"dry_run", opts.DryRun,
 	)
 
-	// ── Step 1: Preflight ──────────────────────────────────────────────────
+	// ── Step 1: Preflight ─────────────────────────────────────────────────
 	if err := p.preflight(ctx, opts, generation); err != nil {
 		backup.Status = model.BackupStatusFailed
 		backup.FailureMsg = err.Error()
@@ -88,15 +96,15 @@ func (p *Pipeline) Create(ctx context.Context, opts CreateOptions) (*model.Backu
 		return backup, nil
 	}
 
-	// ── Step 2: Create destination directory ──────────────────────────────
-	destDir := filepath.Join(opts.BackupBaseDir, backupID)
-	if err := os.MkdirAll(destDir, 0o750); err != nil {
+	// ── Step 2: Staging directory ──────────────────────────────────────────
+	stagingDir := filepath.Join(opts.StagingDir, backupID)
+	if err := os.MkdirAll(stagingDir, 0o750); err != nil {
 		backup.Status = model.BackupStatusFailed
 		backup.FailureMsg = err.Error()
 		return backup, torerrors.Wrapf(torerrors.CodeStorageFailed, err,
-			"creating backup destination %s", destDir)
+			"creating staging directory %s", stagingDir)
 	}
-	backup.StoragePath = destDir
+	backup.StoragePath = stagingDir
 	backup.Status = model.BackupStatusRunning
 
 	// ── Step 3: pg_basebackup ─────────────────────────────────────────────
@@ -104,40 +112,36 @@ func (p *Pipeline) Create(ctx context.Context, opts CreateOptions) (*model.Backu
 	if timeout == 0 {
 		timeout = 6 * time.Hour
 	}
-
 	label := opts.Label
 	if label == "" {
 		label = fmt.Sprintf("toris-%s-%s", backupID[:8], time.Now().UTC().Format("20060102T150405Z"))
 	}
-
-	_, err := pgtools.PgBaseBackup(ctx, p.log, p.tools, opts.Node, pgtools.BaseBackupOptions{
-		DestDir:         destDir,
+	if _, err := pgtools.PgBaseBackup(ctx, p.log, p.tools, opts.Node, pgtools.BaseBackupOptions{
+		DestDir:         stagingDir,
 		Format:          "tar",
-		Compress:        1, // light compression, fast
+		Compress:        1,
 		WALMethod:       "stream",
 		Checkpoint:      "fast",
 		Label:           label,
 		Timeout:         timeout,
 		ReplicationUser: opts.ReplicationUser,
 		Password:        opts.ReplicationPassword,
-	})
-	if err != nil {
+	}); err != nil {
 		backup.Status = model.BackupStatusFailed
 		backup.FailureMsg = err.Error()
-		// Keep the failed backup dir for forensics.
 		return backup, err
 	}
 
-	// ── Step 4: Build and write manifest ──────────────────────────────────
-	artifacts, totalBytes, err := manifest.BuildArtifacts(backupID, destDir)
+	// ── Step 4: Manifest ───────────────────────────────────────────────────
+	artifacts, totalBytes, err := manifest.BuildArtifacts(backupID, stagingDir)
 	if err != nil {
 		backup.Status = model.BackupStatusFailed
 		backup.FailureMsg = fmt.Sprintf("manifest build failed: %v", err)
 		return backup, err
 	}
-
 	m := &model.BackupManifest{
 		BackupID:        backupID,
+		ClusterID:       opts.ClusterID,
 		NodeID:          opts.Node.ID,
 		Generation:      generation,
 		CreatedAt:       util.NowUTC(),
@@ -145,7 +149,7 @@ func (p *Pipeline) Create(ctx context.Context, opts CreateOptions) (*model.Backu
 		Artifacts:       artifacts,
 		TotalSizeBytes:  totalBytes,
 	}
-	if err := manifest.Write(destDir, m); err != nil {
+	if err := manifest.Write(stagingDir, m); err != nil {
 		backup.Status = model.BackupStatusFailed
 		backup.FailureMsg = fmt.Sprintf("manifest write failed: %v", err)
 		return backup, err
@@ -157,41 +161,52 @@ func (p *Pipeline) Create(ctx context.Context, opts CreateOptions) (*model.Backu
 	if verifyTimeout == 0 {
 		verifyTimeout = 30 * time.Minute
 	}
-	if _, err := pgtools.PgVerifyBackup(ctx, p.log, p.tools, destDir, verifyTimeout); err != nil {
+	if _, err := pgtools.PgVerifyBackup(ctx, p.log, p.tools, stagingDir, verifyTimeout); err != nil {
 		backup.Status = model.BackupStatusFailed
 		backup.FailureMsg = fmt.Sprintf("verification failed: %v", err)
-		// Do NOT delete the backup. Keep it for debugging.
 		return backup, err
 	}
-
 	now := util.NowUTC()
 	backup.Status = model.BackupStatusVerified
 	backup.FinishedAt = util.Ptr(now)
 	backup.VerifiedAt = util.Ptr(now)
 
+	// ── Step 6: Upload to storage backend ─────────────────────────────────
+	if err := p.uploadToStorage(ctx, backupID, stagingDir); err != nil {
+		if opts.OffSiteRequired {
+			backup.Status = model.BackupStatusFailed
+			backup.FailureMsg = fmt.Sprintf("storage upload failed: %v", err)
+			return backup, err
+		}
+		p.log.Warn("storage upload failed (offsite_required=false)",
+			"backup_id", backupID,
+			"error", err.Error(),
+		)
+	} else {
+		uploadedAt := util.NowUTC()
+		backup.Status = model.BackupStatusUploaded
+		backup.UploadedAt = util.Ptr(uploadedAt)
+	}
+
 	p.log.Info("backup pipeline complete",
 		"backup_id", backupID,
 		"size_bytes", totalBytes,
+		"status", string(backup.Status),
 		"duration", time.Since(backup.StartedAt),
 	)
 	return backup, nil
 }
 
-// ─── Preflight ────────────────────────────────────────────────────────────────
-
 func (p *Pipeline) preflight(ctx context.Context, opts CreateOptions, generation int64) error {
-	// 1. Lease must be held.
-	if !p.lm.HoldingLease() {
-		return torerrors.New(torerrors.CodeLeaseNotHeld,
-			"cannot create backup: this instance does not hold the cluster lease")
+	if p.lm != nil {
+		if !p.lm.HoldingLease() {
+			return torerrors.New(torerrors.CodeLeaseNotHeld,
+				"cannot create backup: this instance does not hold the cluster lease")
+		}
+		if err := p.lm.AssertFencingToken(generation); err != nil {
+			return err
+		}
 	}
-
-	// 2. Fencing token must be current.
-	if err := p.lm.AssertFencingToken(generation); err != nil {
-		return err
-	}
-
-	// 3. Node must be reachable (pg_isready check via tools).
 	readyRes, err := pgtools.PgIsReady(ctx, p.tools, opts.Node, 10*time.Second)
 	if err != nil {
 		return torerrors.Wrapf(torerrors.CodeDBNotReady, err,
@@ -199,30 +214,47 @@ func (p *Pipeline) preflight(ctx context.Context, opts CreateOptions, generation
 	}
 	if !readyRes.Ready {
 		return torerrors.Newf(torerrors.CodeDBNotReady,
-			"node %s (%s) is not ready for backup: %s",
-			opts.Node.ID, opts.Node.Addr(), readyRes.Message)
+			"node %s (%s) is not ready: %s", opts.Node.ID, opts.Node.Addr(), readyRes.Message)
 	}
-
-	// 4. Storage directory must be writable.
-	if err := checkDirWritable(opts.BackupBaseDir); err != nil {
+	if err := ensureDirWritable(opts.StagingDir); err != nil {
 		return torerrors.Wrapf(torerrors.CodeStorageFailed, err,
-			"backup base dir %s is not writable", opts.BackupBaseDir)
+			"staging dir %s is not writable", opts.StagingDir)
 	}
-
-	// 5. Required tools must be available (already checked at startup, but verify).
 	if p.tools == nil {
 		return torerrors.New(torerrors.CodeToolNotFound, "pg_* tools not initialized")
 	}
-
-	p.log.Info("backup preflight passed",
-		"node", opts.Node.Addr(),
-		"dest", opts.BackupBaseDir,
-	)
+	p.log.Info("backup preflight passed", "node", opts.Node.Addr())
 	return nil
 }
 
-// checkDirWritable creates the dir if needed and checks write access.
-func checkDirWritable(dir string) error {
+func (p *Pipeline) uploadToStorage(ctx context.Context, backupID, stagingDir string) error {
+	entries, err := os.ReadDir(stagingDir)
+	if err != nil {
+		return fmt.Errorf("reading staging directory: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		localPath := filepath.Join(stagingDir, entry.Name())
+		key := fs.KeyForBackup(backupID, entry.Name())
+		if err := fs.WriteFile(ctx, p.store, key, localPath); err != nil {
+			return fmt.Errorf("uploading %s: %w", entry.Name(), err)
+		}
+		p.log.Info("artifact uploaded to storage", "key", key)
+	}
+	return nil
+}
+
+// Prune applies the retention policy and removes pruned artifacts from storage.
+func (p *Pipeline) Prune(ctx context.Context, backups []*model.Backup) ([]string, error) {
+	if p.enforcer == nil {
+		return nil, nil
+	}
+	return p.enforcer.Apply(ctx, backups)
+}
+
+func ensureDirWritable(dir string) error {
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return err
 	}

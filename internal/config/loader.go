@@ -97,9 +97,11 @@ func defaultConfig() *Config {
 			AcquireRetryInterval: 5 * time.Second,
 		},
 		Failover: FailoverConfig{
-			Enabled:                false,
-			UnhealthyThreshold:     60 * time.Second,
-			MaxReplicationLagBytes: 64 * 1024 * 1024,
+			Enabled:                    false,
+			UnhealthyThreshold:         60 * time.Second,
+			MaxReplicationLagBytes:     64 * 1024 * 1024,
+			ReplicationOutageThreshold: 5 * time.Minute,
+			AutoRewindAfterFailover:    true,
 		},
 		Proxy: ProxyConfig{
 			Enabled:     true,

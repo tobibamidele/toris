@@ -116,14 +116,6 @@ type S3Config struct {
 	SecretKey string `mapstructure:"secret_key" yaml:"secret_key"`
 }
 
-// RestoreConfig controls restore defaults.
-type RestoreConfig struct {
-	// TempDir is where rehearsal restores are staged.
-	TempDir string `mapstructure:"temp_dir" yaml:"temp_dir"`
-	// StartAfterRestore: if true, attempt to start the DB after restoring.
-	StartAfterRestore bool `mapstructure:"start_after_restore" yaml:"start_after_restore"`
-}
-
 // LeaderConfig controls lease-based leader election.
 type LeaderConfig struct {
 	// LeaseTTL is how long a lease is valid without renewal.
@@ -142,6 +134,23 @@ type FailoverConfig struct {
 	UnhealthyThreshold time.Duration `mapstructure:"unhealthy_threshold" yaml:"unhealthy_threshold"`
 	// MaxReplicationLagBytes: replica with more lag is not promoted.
 	MaxReplicationLagBytes int64 `mapstructure:"max_replication_lag_bytes" yaml:"max_replication_lag_bytes"`
+	// ReplicationOutageThreshold is how long all replicas must be unreachable
+	// before the outage is classified as unsafe (Class A escalation).
+	// Defaults to UnhealthyThreshold when unset.
+	ReplicationOutageThreshold time.Duration `mapstructure:"replication_outage_threshold" yaml:"replication_outage_threshold"`
+	// AutoRewindAfterFailover: attempt pg_rewind on the old primary after failover.
+	// If rewind fails, falls back to full reseed.
+	AutoRewindAfterFailover bool `mapstructure:"auto_rewind_after_failover" yaml:"auto_rewind_after_failover"`
+}
+
+// RestoreConfig controls restore defaults.
+type RestoreConfig struct {
+	// TempDir is where rehearsal restores are staged.
+	TempDir string `mapstructure:"temp_dir" yaml:"temp_dir"`
+	// StartAfterRestore: if true, attempt to start the DB after restoring.
+	StartAfterRestore bool `mapstructure:"start_after_restore" yaml:"start_after_restore"`
+	// DataDir overrides the default PostgreSQL data directory for restores.
+	DataDir string `mapstructure:"data_dir" yaml:"data_dir"`
 }
 
 // ProxyConfig controls the stable TCP proxy listener.
