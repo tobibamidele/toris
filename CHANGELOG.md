@@ -10,6 +10,92 @@ Release candidates are tagged as `vMAJOR.MINOR.PATCH-rc.N`.
 
 ---
 
+## [v0.3.1] - 2026-05-14
+
+### Fixed
+
+- **Backup records were never persisted to the control database.**
+  `Pipeline.Create` returned a `*model.Backup` record and documented
+  "the caller is responsible for persisting this," but no caller ever did.
+  Backup history was stored only in the storage backend artifacts; the control
+  DB had no `toris_control.backups` table and `toris backup list` was reading
+  directory listings instead of real records. This patch adds:
+  - `internal/backup/store.go` — `BackupStore` with `EnsureSchema`, `Insert`,
+    `UpdateStatus`, `MarkPruned`, `Get`, `List`, `LatestVerified`,
+    `FreshestVerifiedAt`, and `ListByStatus`.
+  - `Pipeline` gains a `bstore *Store` field (injected; nil-safe in CLI mode).
+  - `Insert` is called immediately after the backup struct is created so a
+    crash mid-run leaves a `pending` record rather than no record.
+  - `UpdateStatus` is called at every status transition: running, verified,
+    uploaded, failed.
+  - `app.bootstrap` calls `bstore.EnsureSchema` at daemon startup.
+
+- **`toris backup list` read directory listings instead of the control DB.**
+  Replaced the `os.ReadDir` implementation with a query to
+  `toris_control.backups` via `BackupStore.List`. Output now shows ID, status,
+  size, and start time in a formatted table. Falls back gracefully if the
+  control DB is unreachable.
+
+- **`toris backup prune` was registered in the brief but never implemented.**
+  `cmd.AddCommand(createCmd, verifyCmd, listCmd)` was missing `pruneCmd`.
+  The `pruneCmd` is now implemented: it fetches all backup records from the
+  control DB, passes them to `retention.Enforcer.Apply`, deletes artifacts
+  from the storage backend, and calls `BackupStore.MarkPruned` for each
+  pruned record. Requires `--force` or interactive confirmation.
+
+- **`toris cluster status` showed config-derived static output.**
+  Replaced with a real control DB query: loads the node registry via
+  `cluster.Registry`, queries the current lease via `leader.Manager.Status`,
+  and shows the freshest verified backup timestamp via
+  `BackupStore.FreshestVerifiedAt`. Degrades gracefully to config-derived
+  output if the control DB is unreachable, with a warning log.
+
+- **`toris reseed` printed a stub message instead of running.**
+  Replaced with a real implementation calling `restore.Reseeder.Reseed`.
+  If `--backup-id` is omitted, the latest verified backup is resolved
+  automatically from the control DB. Prints the job ID, backup ID, status,
+  duration, and the `pg_ctl start` command to use after reseeding completes.
+
+- **`toris backup create` passed `nil` as the backup store.**
+  Now attempts to open a control DB connection before creating the backup.
+  If the control DB is reachable, the backup record is persisted throughout
+  the pipeline. If it is unreachable, the backup proceeds with a warning log
+  and no control DB persistence (same behaviour as before, but now explicit).
+
+### Added
+
+- `internal/backup/store.go` — new file, documented above.
+- `internal/backup/store_test.go` — unit tests for status transition contracts,
+  timestamp invariants, and the `FreshestVerifiedAt` sentinel epoch convention.
+
+### Changed
+
+- `internal/backup/pipeline.go`
+  - `Pipeline` struct gains `bstore *Store` field.
+  - `NewPipeline` gains `bstore *Store` parameter (sixth argument; nil-safe).
+  - `persistStatus` helper added: calls `bstore.UpdateStatus` if bstore is set.
+  - `Prune` now calls `bstore.MarkPruned` for each pruned backup ID.
+
+- `internal/app/app.go`
+  - `App` struct gains `bstore *backup.Store` field.
+  - `bstore` is initialised after `controlPool` is created.
+  - `bootstrap` calls `bstore.EnsureSchema`.
+  - `NewPipeline` call updated with `a.bstore` as the sixth argument.
+
+- `internal/cli/commands.go`
+  - `newBackupCmd` — `createCmd` wires `BackupStore` when control DB is
+    reachable; `listCmd` replaced with control DB query; `pruneCmd` added.
+  - `newClusterCmd` — `cluster status` queries the control DB for live node
+    state, lease, and backup freshness.
+  - `newReseedCmd` — replaced stub with real `Reseeder.Reseed` call; added
+    `--backup-id` and `--target-dir` flags; auto-resolves latest verified
+    backup from control DB when `--backup-id` is omitted.
+  - New imports: `"github.com/tobibamidele/toris/internal/cluster"`,
+    `"github.com/tobibamidele/toris/internal/retention"`.
+  - `NewPipeline` call sites updated to pass `bstore` as sixth argument.
+
+---
+
 ## [v0.3.0] - 2026-05-13
 
 ### Added

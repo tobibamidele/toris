@@ -83,6 +83,7 @@ type App struct {
 	auditor     *audit.Writer
 	tracker     *health.Tracker
 	store       storage.Backend
+	bstore      *backup.Store
 	backupPL    *backup.Pipeline
 	rewinder    *restore.Rewinder
 	enforcer    *retention.Enforcer
@@ -145,6 +146,8 @@ func New(cfg *config.Config, log *logging.Logger) (*App, error) {
 	}
 	a.store = store
 
+	a.bstore = backup.NewStore(pool)
+
 	// ── Retention enforcer ─────────────────────────────────────────────────
 	a.enforcer = retention.New(log, a.store, model.RetentionPolicy{
 		MinCount:   cfg.Backup.Retention.MinCount,
@@ -154,7 +157,7 @@ func New(cfg *config.Config, log *logging.Logger) (*App, error) {
 
 	// ── Backup pipeline ────────────────────────────────────────────────────
 	// Tools checked lazily at daemon startup; nil here and resolved on first use.
-	a.backupPL = backup.NewPipeline(log, a.lm, nil, a.store, a.enforcer)
+	a.backupPL = backup.NewPipeline(log, a.lm, nil, a.store, a.enforcer, a.bstore)
 
 	// ── Rewinder ───────────────────────────────────────────────────────────
 	// Tools resolved at bootstrap; for now set nil until CheckTools runs.
@@ -312,6 +315,9 @@ func (a *App) bootstrap(ctx context.Context) error {
 	}
 	if err := a.registry.EnsureSchema(ctx); err != nil {
 		return fmt.Errorf("cluster registry schema: %w", err)
+	}
+	if err := a.bstore.EnsureSchema(ctx); err != nil {
+		return fmt.Errorf("backup store schema: %w", err)
 	}
 	if err := a.registry.Load(ctx); err != nil {
 		return fmt.Errorf("loading cluster registry: %w", err)

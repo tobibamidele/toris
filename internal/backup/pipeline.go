@@ -47,6 +47,7 @@ type Pipeline struct {
 	tools    *pgtools.Tools
 	store    storage.Backend
 	enforcer *retention.Enforcer
+	bstore   *Store
 }
 
 // NewPipeline creates a backup Pipeline.
@@ -57,8 +58,9 @@ func NewPipeline(
 	tools *pgtools.Tools,
 	store storage.Backend,
 	enforcer *retention.Enforcer,
+	bstore *Store,
 ) *Pipeline {
-	return &Pipeline{log: log, lm: lm, tools: tools, store: store, enforcer: enforcer}
+	return &Pipeline{log: log, lm: lm, tools: tools, store: store, enforcer: enforcer, bstore: bstore}
 }
 
 // Create runs the full backup pipeline and returns the completed Backup record.
@@ -76,6 +78,16 @@ func (p *Pipeline) Create(ctx context.Context, opts CreateOptions) (*model.Backu
 		Generation: generation,
 		Status:     model.BackupStatusPending,
 		StartedAt:  util.NowUTC(),
+	}
+
+	if p.bstore != nil {
+		if err := p.bstore.Insert(ctx, backup); err != nil {
+			p.log.Warn(
+				"could not persist backup record to control DB",
+				"backup_id", backupID,
+				"error", err.Error(),
+			)
+		}
 	}
 
 	p.log.Info("backup pipeline starting",
@@ -164,12 +176,15 @@ func (p *Pipeline) Create(ctx context.Context, opts CreateOptions) (*model.Backu
 	if _, err := pgtools.PgVerifyBackup(ctx, p.log, p.tools, stagingDir, verifyTimeout); err != nil {
 		backup.Status = model.BackupStatusFailed
 		backup.FailureMsg = fmt.Sprintf("verification failed: %v", err)
+		p.persistStatus(ctx, backup)
 		return backup, err
 	}
 	now := util.NowUTC()
 	backup.Status = model.BackupStatusVerified
 	backup.FinishedAt = util.Ptr(now)
 	backup.VerifiedAt = util.Ptr(now)
+
+	p.persistStatus(ctx, backup)
 
 	// ── Step 6: Upload to storage backend ─────────────────────────────────
 	if err := p.uploadToStorage(ctx, backupID, stagingDir); err != nil {
@@ -186,6 +201,7 @@ func (p *Pipeline) Create(ctx context.Context, opts CreateOptions) (*model.Backu
 		uploadedAt := util.NowUTC()
 		backup.Status = model.BackupStatusUploaded
 		backup.UploadedAt = util.Ptr(uploadedAt)
+		p.persistStatus(ctx, backup)
 	}
 
 	p.log.Info("backup pipeline complete",
@@ -246,12 +262,42 @@ func (p *Pipeline) uploadToStorage(ctx context.Context, backupID, stagingDir str
 	return nil
 }
 
+func (p *Pipeline) persistStatus(ctx context.Context, b *model.Backup) {
+	if p.bstore == nil {
+		return
+	}
+
+	if err := p.bstore.UpdateStatus(ctx, b); err != nil {
+		p.log.Warn(
+			"could not update backup record in control DB",
+			"backup_id", b.ID,
+			"error", err.Error(),
+		)
+	}
+}
+
 // Prune applies the retention policy and removes pruned artifacts from storage.
 func (p *Pipeline) Prune(ctx context.Context, backups []*model.Backup) ([]string, error) {
 	if p.enforcer == nil {
 		return nil, nil
 	}
-	return p.enforcer.Apply(ctx, backups)
+	pruned, err := p.enforcer.Apply(ctx, backups)
+	if err != nil {
+		return pruned, err
+	}
+
+	if p.bstore != nil {
+		for _, id := range pruned {
+			if markErr := p.bstore.MarkPruned(ctx, id); markErr != nil {
+				p.log.Warn(
+					"could not mark backup pruned in control DB",
+					"backup_id", id,
+					"error", markErr.Error(),
+				)
+			}
+		}
+	}
+	return pruned, nil
 }
 
 func ensureDirWritable(dir string) error {

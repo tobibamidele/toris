@@ -11,11 +11,13 @@ import (
 
 	"github.com/tobibamidele/toris/internal/app"
 	"github.com/tobibamidele/toris/internal/backup"
+	"github.com/tobibamidele/toris/internal/cluster"
 	"github.com/tobibamidele/toris/internal/config"
 	pgback "github.com/tobibamidele/toris/internal/db/postgres"
 	"github.com/tobibamidele/toris/internal/leader"
 	"github.com/tobibamidele/toris/internal/logging"
 	"github.com/tobibamidele/toris/internal/restore"
+	"github.com/tobibamidele/toris/internal/retention"
 	"github.com/tobibamidele/toris/internal/storage"
 	fsstorage "github.com/tobibamidele/toris/internal/storage/fs"
 	"github.com/tobibamidele/toris/internal/util"
@@ -196,14 +198,63 @@ func newClusterCmd() *cobra.Command {
 				return err
 			}
 			log.Info("cluster status requested")
-			// TODO(impl): query control DB for cluster record.
-			// For now, print config-derived summary.
-			outputResult(cfg, map[string]any{
-				"cluster_id": cfg.Cluster.ID,
-				"name":       cfg.Cluster.Name,
-				"nodes":      len(cfg.Cluster.Nodes),
-				"note":       "connect to control DB for live status; run 'toris daemon' first",
-			})
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			pool, poolErr := connectControlDB(ctx, cfg.ControlDSN)
+			if poolErr != nil {
+				// Fall back to config-derived summary if control DB is unreachable.
+				log.Warn("cannot reach control DB — showing config-derived summary",
+					"error", poolErr.Error())
+				outputResult(cfg, map[string]any{
+					"cluster_id": cfg.Cluster.ID,
+					"name":       cfg.Cluster.Name,
+					"nodes":      len(cfg.Cluster.Nodes),
+					"note":       "control DB unreachable — live status unavailable",
+				})
+				return nil
+			}
+			defer pool.Close()
+
+			reg := cluster.New(log, pool, cfg.Cluster.ID)
+			if loadErr := reg.Load(ctx); loadErr != nil {
+				log.Warn("could not load node registry", "error", loadErr.Error())
+			}
+			nodes := reg.All()
+
+			bs := backup.NewStore(pool)
+			latestAt, _ := bs.FreshestVerifiedAt(ctx, cfg.Cluster.ID)
+
+			lm := leader.New(log, pool, cfg.Cluster.ID, cfg.InstanceID,
+				cfg.Leader.LeaseTTL, cfg.Leader.RenewInterval)
+			lease, _ := lm.Status(ctx)
+
+			if cfg.OutputFormat == "json" || gFlags.outputFormat == "json" {
+				printJSON(map[string]any{
+					"cluster_id":           cfg.Cluster.ID,
+					"name":                 cfg.Cluster.Name,
+					"nodes":                nodes,
+					"lease":                lease,
+					"freshest_verified_at": latestAt,
+				})
+			} else {
+				fmt.Printf("Cluster : %s (%s)\n", cfg.Cluster.Name, cfg.Cluster.ID)
+				if lease != nil {
+					fmt.Printf("Leader  : %s  gen=%d  %s\n",
+						lease.InstanceID, lease.Generation, string(lease.Status))
+				} else {
+					fmt.Println("Leader  : (no active lease)")
+				}
+				if !latestAt.IsZero() && latestAt.Year() > 1970 {
+					fmt.Printf("Backup  : last verified %s\n", latestAt.Format(time.RFC3339))
+				} else {
+					fmt.Println("Backup  : no verified backups")
+				}
+				fmt.Printf("Nodes   : %d\n", len(nodes))
+				for _, n := range nodes {
+					fmt.Printf("  %-16s  %-10s  %-10s  %s:%d\n",
+						n.ID, string(n.Role), string(n.Status), n.Host, n.Port)
+				}
+			}
 			return nil
 		},
 	})
@@ -345,7 +396,6 @@ func newBackupCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-
 			ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeouts.Backup)
 			defer cancel()
 
@@ -353,23 +403,29 @@ func newBackupCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-
-			// For demo: use first node. Production: query for current primary.
 			if len(cfg.Cluster.Nodes) == 0 {
 				return fmt.Errorf("no nodes configured")
 			}
 			nc := cfg.Cluster.Nodes[0]
 			node := &model.Node{ID: nc.ID, Host: nc.Host, Port: nc.Port}
-
-			// Resolve auth profile.
 			replicationUser, replicationPass := resolveAuth(cfg, nc.AuthProfile)
 
-			// CLI backup: no lease manager (outside daemon mode).
 			store, storeErr := fsstorage.New(cfg.Backup.BaseDir)
 			if storeErr != nil {
 				return fmt.Errorf("initialising storage: %w", storeErr)
 			}
-			pl := backup.NewPipeline(log, nil, tools, store, nil)
+
+			// Wire the backup store if control DB is reachable; nil otherwise (non-fatal).
+			var bs *backup.Store
+			if pool, poolErr := connectControlDB(ctx, cfg.ControlDSN); poolErr == nil {
+				defer pool.Close()
+				bs = backup.NewStore(pool)
+			} else {
+				log.Warn("control DB unavailable — backup record will not be persisted",
+					"error", poolErr.Error())
+			}
+
+			pl := backup.NewPipeline(log, nil, tools, store, nil, bs)
 			b, err := pl.Create(ctx, backup.CreateOptions{
 				Node:                node,
 				ClusterID:           cfg.Cluster.ID,
@@ -381,18 +437,16 @@ func newBackupCmd() *cobra.Command {
 				ReplicationUser:     replicationUser,
 				ReplicationPassword: replicationPass,
 			})
-
 			if err != nil {
 				if b != nil {
 					log.Error("backup failed", "backup_id", b.ID, "error", err.Error())
 				}
 				return err
 			}
-
-			if cfg.OutputFormat == "json" {
+			if cfg.OutputFormat == "json" || gFlags.outputFormat == "json" {
 				printJSON(b)
 			} else {
-				fmt.Printf("✓ Backup %s\n", b.ID)
+				fmt.Printf("Backup %s\n", b.ID)
 				fmt.Printf("  Status  : %s\n", b.Status)
 				fmt.Printf("  Path    : %s\n", b.StoragePath)
 				fmt.Printf("  Size    : %s\n", formatBytes(b.SizeBytes))
@@ -419,21 +473,19 @@ func newBackupCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-
 			backupPath := args[0]
 			res, err := pgback.PgVerifyBackup(ctx, log, tools, backupPath, cfg.Timeouts.ToolExec)
 			if err != nil {
 				return fmt.Errorf("verification failed: %w", err)
 			}
-
-			if cfg.OutputFormat == "json" {
+			if cfg.OutputFormat == "json" || gFlags.outputFormat == "json" {
 				printJSON(map[string]any{
 					"status":   "verified",
 					"path":     backupPath,
 					"duration": res.Duration.String(),
 				})
 			} else {
-				fmt.Printf("✓ Backup verified: %s (%s)\n", backupPath, util.FormatDuration(res.Duration))
+				fmt.Printf("Backup verified: %s (%s)\n", backupPath, util.FormatDuration(res.Duration))
 			}
 			return nil
 		},
@@ -448,27 +500,101 @@ func newBackupCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			// TODO: query manifest store.
-			fmt.Printf("Backups in %s:\n", cfg.Backup.BaseDir)
-			entries, err := os.ReadDir(cfg.Backup.BaseDir)
-			if err != nil {
-				if os.IsNotExist(err) {
-					fmt.Println("  (no backups found)")
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			pool, poolErr := connectControlDB(ctx, cfg.ControlDSN)
+			if poolErr != nil {
+				return fmt.Errorf("connecting to control DB: %w", poolErr)
+			}
+			defer pool.Close()
+			bs := backup.NewStore(pool)
+			records, listErr := bs.List(ctx, cfg.Cluster.ID, 0)
+			if listErr != nil {
+				return fmt.Errorf("listing backups: %w", listErr)
+			}
+			if cfg.OutputFormat == "json" || gFlags.outputFormat == "json" {
+				printJSON(records)
+			} else {
+				if len(records) == 0 {
+					fmt.Println("No backups found.")
 					return nil
 				}
-				return err
-			}
-			for _, e := range entries {
-				if e.IsDir() {
-					info, _ := e.Info()
-					fmt.Printf("  %s  %s\n", e.Name(), info.ModTime().Format(time.RFC3339))
+				fmt.Printf("%-32s  %-10s  %-10s  %s\n", "ID", "STATUS", "SIZE", "STARTED")
+				fmt.Println("─────────────────────────────────────────────────────────────────")
+				for _, b := range records {
+					fmt.Printf("%-32s  %-10s  %-10s  %s\n",
+						b.ID, string(b.Status),
+						formatBytes(b.SizeBytes),
+						b.StartedAt.Format(time.RFC3339))
 				}
 			}
 			return nil
 		},
 	}
 
-	cmd.AddCommand(createCmd, verifyCmd, listCmd)
+	// backup prune
+	pruneCmd := &cobra.Command{
+		Use:   "prune",
+		Short: "Apply retention policy and remove old backups",
+		Long: `Evaluates the configured retention policy and removes artifacts from storage
+for backups that exceed the policy thresholds. The backup record in the control
+DB is marked pruned but not deleted (kept for audit history).`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, log, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			if !gFlags.force {
+				ok, _ := confirmDestructive("apply retention policy and delete old backup artifacts?")
+				if !ok {
+					fmt.Println("aborted")
+					return nil
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			pool, poolErr := connectControlDB(ctx, cfg.ControlDSN)
+			if poolErr != nil {
+				return fmt.Errorf("connecting to control DB: %w", poolErr)
+			}
+			defer pool.Close()
+			bs := backup.NewStore(pool)
+			records, listErr := bs.List(ctx, cfg.Cluster.ID, 0)
+			if listErr != nil {
+				return fmt.Errorf("listing backups: %w", listErr)
+			}
+			store, storeErr := fsstorage.New(cfg.Backup.BaseDir)
+			if storeErr != nil {
+				return fmt.Errorf("opening storage: %w", storeErr)
+			}
+			policy := model.RetentionPolicy{
+				MinCount:   cfg.Backup.Retention.MinCount,
+				MaxAgeDays: cfg.Backup.Retention.MaxAgeDays,
+				KeepFailed: cfg.Backup.Retention.KeepFailed,
+			}
+			enf := retention.New(log, store, policy)
+			pl := backup.NewPipeline(log, nil, nil, store, enf, bs)
+			pruned, pruneErr := pl.Prune(ctx, records)
+			if pruneErr != nil {
+				return fmt.Errorf("prune failed: %w", pruneErr)
+			}
+			if cfg.OutputFormat == "json" || gFlags.outputFormat == "json" {
+				printJSON(map[string]any{"pruned": pruned, "count": len(pruned)})
+			} else {
+				if len(pruned) == 0 {
+					fmt.Println("No backups pruned (retention policy satisfied).")
+				} else {
+					fmt.Printf("Pruned %d backup(s):\n", len(pruned))
+					for _, id := range pruned {
+						fmt.Printf("  %s\n", id)
+					}
+				}
+			}
+			return nil
+		},
+	}
+
+	cmd.AddCommand(createCmd, verifyCmd, listCmd, pruneCmd)
 	return cmd
 }
 
@@ -535,26 +661,87 @@ The target directory must be empty. PostgreSQL must not be running on it.`,
 // ─── toris reseed ─────────────────────────────────────────────────────────────
 
 func newReseedCmd() *cobra.Command {
-	return &cobra.Command{
+	var backupID, targetDir string
+	cmd := &cobra.Command{
 		Use:   "reseed",
-		Short: "Reseed a replica from the latest verified backup",
+		Short: "Reseed a replica from a verified backup",
+		Long: `Restores a verified backup into the target data directory and writes
+standby.signal so PostgreSQL starts in replica mode.
+ 
+The target PostgreSQL instance must be stopped before running reseed.
+If --backup-id is omitted, the latest verified backup is used automatically.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, log, err := loadConfig()
+			cfg, log, err := loadConfig()
 			if err != nil {
 				return err
 			}
-			log.Info("reseed requested")
+			if targetDir == "" {
+				return fmt.Errorf("--target-dir is required")
+			}
 			if !gFlags.force {
-				ok, err := confirmDestructive("reseed will replace the target node's data. Proceed?")
-				if err != nil || !ok {
+				ok, _ := confirmDestructive(
+					fmt.Sprintf("reseed will overwrite %s with backup data. Proceed?", targetDir))
+				if !ok {
 					fmt.Println("aborted")
 					return nil
 				}
 			}
-			fmt.Println("⚙  Reseeding replica... (see internal/restore/reseed.go)")
+			ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeouts.Restore)
+			defer cancel()
+
+			// Resolve backup ID — if not provided, find latest verified from control DB.
+			effectiveBackupID := backupID
+			if effectiveBackupID == "" {
+				pool, poolErr := connectControlDB(ctx, cfg.ControlDSN)
+				if poolErr != nil {
+					return fmt.Errorf("connecting to control DB to find latest backup: %w", poolErr)
+				}
+				defer pool.Close()
+				bs := backup.NewStore(pool)
+				latest, latestErr := bs.LatestVerified(ctx, cfg.Cluster.ID)
+				if latestErr != nil {
+					return fmt.Errorf("no verified backup found (pass --backup-id to specify one): %w", latestErr)
+				}
+				effectiveBackupID = latest.ID
+				log.Info("using latest verified backup", "backup_id", effectiveBackupID)
+			}
+
+			store, storeErr := fsstorage.New(cfg.Backup.BaseDir)
+			if storeErr != nil {
+				return fmt.Errorf("opening storage: %w", storeErr)
+			}
+			r := restore.NewReseeder(log, store)
+			job, jobErr := r.Reseed(ctx, restore.ReseedOptions{
+				BackupID:  effectiveBackupID,
+				TargetDir: targetDir,
+				TempDir:   cfg.Restore.TempDir,
+				ClusterID: cfg.Cluster.ID,
+				Timeout:   cfg.Timeouts.Restore,
+			})
+			if jobErr != nil {
+				if job != nil {
+					log.Error("reseed failed", "job_id", job.ID, "artifact_dir", job.ArtifactDir)
+				}
+				return jobErr
+			}
+			if cfg.OutputFormat == "json" || gFlags.outputFormat == "json" {
+				printJSON(job)
+			} else {
+				fmt.Printf("Reseed complete\n")
+				fmt.Printf("  Job      : %s\n", job.ID)
+				fmt.Printf("  Backup   : %s\n", effectiveBackupID)
+				fmt.Printf("  Status   : %s\n", string(job.Status))
+				if job.FinishedAt != nil {
+					fmt.Printf("  Duration : %s\n", util.FormatDuration(job.FinishedAt.Sub(job.StartedAt)))
+				}
+				fmt.Println("  Start the replica: pg_ctl start -D " + targetDir)
+			}
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&backupID, "backup-id", "", "backup to reseed from (default: latest verified)")
+	cmd.Flags().StringVar(&targetDir, "target-dir", "", "PostgreSQL data directory to write into (required)")
+	return cmd
 }
 
 // ─── toris leader ─────────────────────────────────────────────────────────────
