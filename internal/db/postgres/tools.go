@@ -199,10 +199,16 @@ func PgBaseBackup(ctx context.Context, log *logging.Logger, tools *Tools, node *
 // ─── pg_verifybackup ─────────────────────────────────────────────────────────
 
 // PgVerifyBackup runs pg_verifybackup against a backup directory.
+//
+// The --no-parse-wal flag is always passed: toris produces backups with
+// pg_basebackup -X stream, whose final WAL segment may be incomplete (torn)
+// by design. pg_verifybackup would attempt to parse WAL and fail on that
+// segment; skipping the parse still verifies every manifest file's presence,
+// size and checksum. Full WAL validation is left to crash recovery.
 func PgVerifyBackup(ctx context.Context, log *logging.Logger, tools *Tools, backupDir string, timeout time.Duration) (*torexec.Result, error) {
 	cmd := torexec.Cmd{
 		Binary:  tools.PgVerifyBackup,
-		Args:    []string{backupDir},
+		Args:    []string{"--no-parse-wal", backupDir},
 		Timeout: timeout,
 	}
 

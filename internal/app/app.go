@@ -28,6 +28,11 @@
 //  5. Metrics HTTP server
 //     Exposes /metrics and /healthz.
 //
+//  6. Node watcher
+//     Polls toris_control.nodes every 30 seconds and syncs any operator-added
+//     or operator-removed nodes into the in-memory registry.
+//     Allows 'toris node add/remove' to take effect without a daemon restart.
+//
 // Signal handling:
 //
 //	SIGTERM and SIGINT cancel the root context, triggering graceful shutdown
@@ -54,6 +59,7 @@ import (
 	"github.com/tobibamidele/toris/internal/health"
 	"github.com/tobibamidele/toris/internal/leader"
 	"github.com/tobibamidele/toris/internal/logging"
+	"github.com/tobibamidele/toris/internal/nodewatch"
 	"github.com/tobibamidele/toris/internal/restore"
 	"github.com/tobibamidele/toris/internal/retention"
 	"github.com/tobibamidele/toris/internal/routing"
@@ -88,6 +94,7 @@ type App struct {
 	rewinder    *restore.Rewinder
 	enforcer    *retention.Enforcer
 	engine      *failover.Engine
+	nodeWatcher *nodewatch.Watcher // v0.4.0
 }
 
 // New constructs and wires all daemon subsystems.
@@ -130,7 +137,7 @@ func New(cfg *config.Config, log *logging.Logger) (*App, error) {
 	// ── Replication health tracker ────────────────────────────────────────
 	a.tracker = health.NewTracker(
 		log,
-		cfg.Failover.UnhealthyThreshold, // outage threshold before IsUnsafe
+		cfg.Failover.UnhealthyThreshold,
 		cfg.Failover.MaxReplicationLagBytes,
 	)
 
@@ -156,11 +163,9 @@ func New(cfg *config.Config, log *logging.Logger) (*App, error) {
 	})
 
 	// ── Backup pipeline ────────────────────────────────────────────────────
-	// Tools checked lazily at daemon startup; nil here and resolved on first use.
 	a.backupPL = backup.NewPipeline(log, a.lm, nil, a.store, a.enforcer, a.bstore)
 
 	// ── Rewinder ───────────────────────────────────────────────────────────
-	// Tools resolved at bootstrap; for now set nil until CheckTools runs.
 	a.rewinder = restore.NewRewinder(log, nil, a.store)
 
 	// ── Failover engine ───────────────────────────────────────────────────
@@ -181,8 +186,13 @@ func New(cfg *config.Config, log *logging.Logger) (*App, error) {
 		a.auditor,
 		a.tracker,
 		a.metrics,
-		nil, // rewinder injected after tool check at bootstrap
+		nil,
 	)
+
+	// ── Node watcher (v0.4.0) ─────────────────────────────────────────────
+	// Polls toris_control.nodes every 30s so 'toris node add/remove' takes
+	// effect without a daemon restart.
+	a.nodeWatcher = nodewatch.New(log, a.registry)
 
 	return a, nil
 }
@@ -216,11 +226,23 @@ func (a *App) Run() error {
 	bootstrapCancel()
 
 	// ── Lease acquisition ─────────────────────────────────────────────────
-	// Attempt to acquire the lease before starting goroutines.
-	// If another instance holds it, keep retrying.
 	if err := a.acquireLeaseWithRetry(rootCtx); err != nil {
 		return fmt.Errorf("could not acquire cluster lease: %w", err)
 	}
+
+	// ── Seed node registry ────────────────────────────────────────────────
+	// Runs after lease acquisition: toris_control.nodes has a foreign key to
+	// toris_control.leases, so the lease row must exist before node inserts.
+	if err := a.seedRegistry(rootCtx); err != nil {
+		return fmt.Errorf("seeding cluster registry: %w", err)
+	}
+
+	// ── Initial routing target ────────────────────────────────────────────
+	// The proxy must serve connections immediately at startup, not only after
+	// the first failover. Prefer a known non-fenced primary from the registry
+	// (persisted across restarts); otherwise fall back to the configured
+	// primary, which by convention is the first node in cluster.nodes.
+	a.setInitialProxyTarget()
 
 	a.metrics.LeaseAcquisitions.Inc()
 	a.metrics.LeaseGeneration.Set(float64(a.lm.CurrentGeneration()))
@@ -232,8 +254,6 @@ func (a *App) Run() error {
 	)
 
 	// ── Errgroup fan-out ──────────────────────────────────────────────────
-	// All goroutines share the root context. If any returns a non-nil error,
-	// the group cancels the context and all others shut down.
 	g, gCtx := errgroup.WithContext(rootCtx)
 
 	// Goroutine 1: audit writer drain loop
@@ -242,14 +262,9 @@ func (a *App) Run() error {
 	})
 
 	// Goroutine 2: lease renewal loop
-	// This is the Class B handler: if renewal fails, the daemon exits
-	// cleanly and the lease expires naturally, allowing another instance
-	// to take over with a higher generation.
 	g.Go(func() error {
 		err := a.lm.RunRenewLoop(gCtx)
 		if err != nil && gCtx.Err() == nil {
-			// Renewal failed for a reason other than ctx cancel.
-			// This is a Class B failure event.
 			a.log.Error("lease renewal loop exited — daemon is stepping down",
 				"cluster_id", a.cfg.Cluster.ID,
 				"error", err.Error(),
@@ -260,9 +275,6 @@ func (a *App) Run() error {
 	})
 
 	// Goroutine 3: health check loop
-	// Runs independently of the lease renewal loop.
-	// Replica connectivity loss (Class A) is handled here without
-	// touching the lease or triggering demotion.
 	g.Go(func() error {
 		return a.runHealthLoop(gCtx)
 	})
@@ -281,10 +293,24 @@ func (a *App) Run() error {
 		})
 	}
 
+	// Goroutine 6: node watcher (v0.4.0)
+	// A sync failure is logged but never fatal — the watcher is best-effort.
+	// It returns ctx.Err() on cancellation, which the errgroup treats as a
+	// clean exit when rootCtx is done.
+	g.Go(func() error {
+		err := a.nodeWatcher.Run(gCtx)
+		if err != nil && gCtx.Err() == nil {
+			// An unexpected error from the watcher is non-fatal.
+			a.log.Warn("node watcher exited unexpectedly — dynamic node discovery disabled",
+				"error", err.Error(),
+			)
+			return nil // don't kill the daemon over a watch failure
+		}
+		return nil
+	})
+
 	// Block until all goroutines exit.
 	if err := g.Wait(); err != nil && rootCtx.Err() == nil {
-		// An error that was not caused by the root context being canceled
-		// is a real problem.
 		return err
 	}
 
@@ -323,7 +349,16 @@ func (a *App) bootstrap(ctx context.Context) error {
 		return fmt.Errorf("loading cluster registry: %w", err)
 	}
 
-	// Seed the registry from the static config if empty.
+	a.log.Info("bootstrap complete",
+		"nodes_loaded", len(a.registry.All()),
+	)
+	return nil
+}
+
+// seedRegistry populates the registry from the static config if it is empty.
+// This must run after lease acquisition because toris_control.nodes has a
+// foreign key to toris_control.leases (see bootstrap comment in Run).
+func (a *App) seedRegistry(ctx context.Context) error {
 	var configNodes []model.Node
 	for _, nc := range a.cfg.Cluster.Nodes {
 		configNodes = append(configNodes,
@@ -332,11 +367,41 @@ func (a *App) bootstrap(ctx context.Context) error {
 	if err := a.registry.SeedFromConfig(ctx, configNodes); err != nil {
 		return fmt.Errorf("seeding cluster registry: %w", err)
 	}
-
-	a.log.Info("bootstrap complete",
+	a.log.Info("registry seeded from config",
 		"nodes_loaded", len(a.registry.All()),
 	)
 	return nil
+}
+
+// setInitialProxyTarget points the proxy at a node that can serve writes as
+// soon as the daemon starts. It prefers a known primary from the registry
+// (roles survive restarts via the control DB) and otherwise falls back to the
+// configured primary — the first node in cluster.nodes, matching the
+// convention used by 'toris backup create'.
+func (a *App) setInitialProxyTarget() {
+	if a.proxy == nil {
+		return
+	}
+
+	var node *model.Node
+	if p := a.registry.Primary(); p != nil {
+		node = p
+	} else if len(a.cfg.Cluster.Nodes) > 0 {
+		nc := a.cfg.Cluster.Nodes[0]
+		node = &model.Node{ID: nc.ID, Host: nc.Host, Port: nc.Port}
+	}
+	if node == nil {
+		return
+	}
+
+	a.proxy.SetTarget(&model.RoutingTarget{
+		ClusterID:  a.cfg.Cluster.ID,
+		NodeID:     node.ID,
+		Host:       node.Host,
+		Port:       node.Port,
+		Generation: a.lm.CurrentGeneration(),
+		UpdatedAt:  util.NowUTC(),
+	})
 }
 
 // acquireLeaseWithRetry keeps attempting lease acquisition until it succeeds
@@ -360,7 +425,7 @@ func (a *App) acquireLeaseWithRetry(ctx context.Context) error {
 }
 
 // runHealthLoop checks every node on a fixed interval and feeds results to
-// the failover engine. It is entirely decoupled from the lease renewal loop.
+// the failover engine.
 func (a *App) runHealthLoop(ctx context.Context) error {
 	ticker := time.NewTicker(defaultHealthCheckInterval)
 	defer ticker.Stop()
@@ -398,11 +463,9 @@ func (a *App) runHealthRound(ctx context.Context) {
 
 		snapshots[node.ID] = snap
 
-		// Update registry status from snapshot.
 		status := snapshotToNodeStatus(snap, node)
 		_ = a.registry.UpdateStatus(ctx, node.ID, status, snap.Role, snap.ReplicationLagBytes)
 
-		// Record metrics.
 		if a.metrics != nil {
 			a.metrics.HealthCheckLatency.WithLabelValues(node.ID).Observe(elapsed.Seconds())
 			a.metrics.HealthCheckTotal.WithLabelValues(
@@ -411,27 +474,22 @@ func (a *App) runHealthRound(ctx context.Context) {
 		}
 	}
 
-	// Feed the full snapshot set to the failover engine.
 	if err := a.engine.Evaluate(ctx, snapshots); err != nil {
 		a.log.Error("failover engine evaluation error", "error", err.Error())
 	}
 }
 
-// snapshotToNodeStatus maps a health snapshot to the appropriate NodeStatus
-// for the registry, applying the failure class taxonomy.
+// snapshotToNodeStatus maps a health snapshot to the appropriate NodeStatus.
 func snapshotToNodeStatus(snap *model.HealthSnapshot, node *model.Node) model.NodeStatus {
 	if node.Status == model.NodeStatusFenced || node.Status == model.NodeStatusRemoved {
-		// Never downgrade a fenced/removed node via health checks.
 		return node.Status
 	}
 	switch {
 	case snap.Level >= model.HealthLevelPolicyPass:
 		return model.NodeStatusHealthy
 	case snap.Level >= model.HealthLevelRoleKnown:
-		// Reached the DB but policy checks failed — degraded, not unhealthy.
 		return model.NodeStatusDegraded
 	case snap.Level >= model.HealthLevelTransport:
-		// TCP connects but SQL does not — unhealthy.
 		return model.NodeStatusUnhealthy
 	default:
 		return model.NodeStatusUnhealthy

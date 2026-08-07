@@ -16,7 +16,8 @@ GONOSUMDB  := *
 export GONOSUMDB
 export GOFLAGS
 
-.PHONY: all build test lint fmt vet clean doctor help
+.PHONY: all build test lint fmt vet clean doctor help \
+        test-integration integration-up integration-down integration-logs
 
 all: fmt vet build test
 
@@ -31,7 +32,12 @@ build-race:
 	@mkdir -p $(BIN_DIR)
 	$(GO) build -race -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/$(BINARY)-race $(CMD)
 
-## test: run all unit tests
+## build-s3: build with S3 backend support
+build-s3:
+	@mkdir -p $(BIN_DIR)
+	$(GO) build -tags s3 -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/$(BINARY)-s3 $(CMD)
+
+## test: run all unit tests (no DB required)
 test:
 	$(GO) test ./... -count=1 -timeout 120s
 
@@ -48,6 +54,41 @@ test-cover:
 	$(GO) test ./... -coverprofile=coverage.out -covermode=atomic
 	$(GO) tool cover -html=coverage.out -o coverage.html
 	@echo "✓ coverage report: coverage.html"
+
+## integration-up: start the Docker Compose integration test cluster
+integration-up:
+	@echo "Starting integration test cluster..."
+	docker compose -f tests/integration/docker-compose.yml up -d
+	@echo "Waiting for cluster to be ready..."
+	@sleep 5
+	@docker compose -f tests/integration/docker-compose.yml ps
+
+## integration-down: stop and remove the integration test cluster
+integration-down:
+	docker compose -f tests/integration/docker-compose.yml down -v
+	@echo "✓ integration cluster stopped and volumes removed"
+
+## integration-logs: tail logs from the integration cluster
+integration-logs:
+	docker compose -f tests/integration/docker-compose.yml logs -f
+
+## test-integration: run integration tests (requires: make integration-up first)
+##   Pass TORIS_TEST_* env vars to override default DSNs (see harness.go).
+test-integration:
+	@echo "Running integration tests (tag=integration)..."
+	$(GO) test ./tests/integration/... \
+		-tags integration \
+		-count=1 \
+		-timeout 300s \
+		-v \
+		$(INTEGRATION_ARGS)
+
+## test-integration-ci: start cluster, run tests, stop cluster (for CI)
+test-integration-ci: integration-up
+	@echo "Waiting for PostgreSQL to be ready..."
+	@sleep 15
+	$(MAKE) test-integration || ($(MAKE) integration-down; exit 1)
+	$(MAKE) integration-down
 
 ## lint: run golangci-lint (requires golangci-lint in PATH)
 lint:

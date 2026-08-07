@@ -14,8 +14,6 @@
 package restore
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -224,7 +222,7 @@ func (e *Engine) extractArtifacts(ctx context.Context, stagingDir, dataDir strin
 			continue
 		}
 		localPath := filepath.Join(stagingDir, artifact.Filename)
-		if err := extractTar(ctx, localPath, dataDir); err != nil {
+		if err := util.ExtractPGDataArchive(ctx, localPath, dataDir); err != nil {
 			return fmt.Errorf("extracting %s: %w", artifact.Filename, err)
 		}
 		e.log.Info("extracted archive", "filename", artifact.Filename, "dest", dataDir)
@@ -250,71 +248,6 @@ func (e *Engine) fail(job *model.RestoreJob, err error) (*model.RestoreJob, erro
 		"error", err.Error(),
 	)
 	return job, err
-}
-
-// extractTar decompresses and extracts a .tar.gz (or .tar) archive into destDir.
-func extractTar(ctx context.Context, archivePath, destDir string) error {
-	f, err := os.Open(archivePath)
-	if err != nil {
-		return fmt.Errorf("opening archive %s: %w", archivePath, err)
-	}
-	defer f.Close()
-
-	var r io.Reader = f
-	if strings.HasSuffix(archivePath, ".gz") {
-		gz, err := gzip.NewReader(f)
-		if err != nil {
-			return fmt.Errorf("creating gzip reader: %w", err)
-		}
-		defer gz.Close()
-		r = gz
-	}
-
-	tr := tar.NewReader(r)
-	for {
-		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("extraction canceled: %w", err)
-		}
-
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("reading tar header: %w", err)
-		}
-
-		// Security: reject any path that escapes destDir.
-		target := filepath.Join(destDir, filepath.Clean("/"+hdr.Name))
-		if !strings.HasPrefix(target, filepath.Clean(destDir)+string(os.PathSeparator)) &&
-			target != filepath.Clean(destDir) {
-			return fmt.Errorf("archive contains path traversal entry: %s", hdr.Name)
-		}
-
-		switch hdr.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, os.FileMode(hdr.Mode)|0o700); err != nil {
-				return fmt.Errorf("creating directory %s: %w", target, err)
-			}
-		case tar.TypeReg, tar.TypeRegA:
-			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-				return fmt.Errorf("creating parent for %s: %w", target, err)
-			}
-			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)|0o600)
-			if err != nil {
-				return fmt.Errorf("creating file %s: %w", target, err)
-			}
-			if _, err := io.Copy(out, tr); err != nil {
-				out.Close()
-				return fmt.Errorf("writing file %s: %w", target, err)
-			}
-			out.Close()
-		case tar.TypeSymlink:
-			// Skip symlinks for security.
-			continue
-		}
-	}
-	return nil
 }
 
 // writeStandbySignal writes standby.signal into a data directory to configure
