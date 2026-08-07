@@ -71,7 +71,7 @@ func (b *Backend) poolFor(ctx context.Context, node *model.Node) (*pgxpool.Pool,
 // Auth credentials should be injected via PGPASSWORD env or .pgpass in production.
 // This function builds the structural DSN only — no passwords embedded.
 func nodeDSN(node *model.Node) string {
-	return fmt.Sprintf("host=%s port=%d sslmode=require connect_timeout=5",
+	return fmt.Sprintf("host=%s port=%d sslmode=disable connect_timeout=5",
 		node.Host, node.Port)
 }
 

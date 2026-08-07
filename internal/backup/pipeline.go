@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	pgtools "github.com/tobibamidele/toris/internal/db/postgres"
@@ -169,11 +170,23 @@ func (p *Pipeline) Create(ctx context.Context, opts CreateOptions) (*model.Backu
 	backup.SizeBytes = totalBytes
 
 	// ── Step 5: pg_verifybackup ────────────────────────────────────────────
+	// pg_verifybackup in PostgreSQL 17 and earlier only verifies plain-format
+	// backups, so the tar archives produced by pg_basebackup must first be
+	// extracted into a temporary directory.
 	verifyTimeout := opts.VerifyTimeout
 	if verifyTimeout == 0 {
 		verifyTimeout = 30 * time.Minute
 	}
-	if _, err := pgtools.PgVerifyBackup(ctx, p.log, p.tools, stagingDir, verifyTimeout); err != nil {
+	verifyDir, err := PrepareVerifyDir(ctx, stagingDir)
+	if err != nil {
+		backup.Status = model.BackupStatusFailed
+		backup.FailureMsg = fmt.Sprintf("preparing verification directory: %v", err)
+		p.persistStatus(ctx, backup)
+		return backup, err
+	}
+	defer os.RemoveAll(verifyDir)
+
+	if _, err := pgtools.PgVerifyBackup(ctx, p.log, p.tools, verifyDir, verifyTimeout); err != nil {
 		backup.Status = model.BackupStatusFailed
 		backup.FailureMsg = fmt.Sprintf("verification failed: %v", err)
 		p.persistStatus(ctx, backup)
@@ -260,6 +273,55 @@ func (p *Pipeline) uploadToStorage(ctx context.Context, backupID, stagingDir str
 		p.log.Info("artifact uploaded to storage", "key", key)
 	}
 	return nil
+}
+
+// PrepareVerifyDir extracts the tar archives from a staging directory into a
+// fresh temporary directory and drops the pg_basebackup manifest in alongside
+// them, so pg_verifybackup can validate the resulting plain-format tree.
+//
+// pg_verifybackup in PostgreSQL 17 and earlier only verifies plain-format
+// backups; the tar archives produced by pg_basebackup -Ft must be extracted
+// before verification. This is also used by the CLI `backup verify` command.
+func PrepareVerifyDir(ctx context.Context, stagingDir string) (string, error) {
+	verifyDir, err := os.MkdirTemp(filepath.Dir(stagingDir), "verify_*")
+	if err != nil {
+		return "", fmt.Errorf("creating verification directory: %w", err)
+	}
+
+	cleanup := func() {
+		_ = os.RemoveAll(verifyDir)
+	}
+
+	entries, err := os.ReadDir(stagingDir)
+	if err != nil {
+		cleanup()
+		return "", fmt.Errorf("reading staging directory: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".tar.gz") {
+			continue
+		}
+		archivePath := filepath.Join(stagingDir, entry.Name())
+		if err := util.ExtractPGDataArchive(ctx, archivePath, verifyDir); err != nil {
+			cleanup()
+			return "", fmt.Errorf("extracting %s for verification: %w", entry.Name(), err)
+		}
+	}
+
+	// pg_verifybackup reads the manifest from the backup directory. pg_basebackup
+	// writes it next to the tarballs; copy it into the extracted tree.
+	manifestPath := filepath.Join(stagingDir, "backup_manifest")
+	manifestData, err := os.ReadFile(manifestPath)
+	if err != nil {
+		cleanup()
+		return "", fmt.Errorf("reading backup_manifest: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(verifyDir, "backup_manifest"), manifestData, 0o600); err != nil {
+		cleanup()
+		return "", fmt.Errorf("writing backup_manifest into verification directory: %w", err)
+	}
+
+	return verifyDir, nil
 }
 
 func (p *Pipeline) persistStatus(ctx context.Context, b *model.Backup) {

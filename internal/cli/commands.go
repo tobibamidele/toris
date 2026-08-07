@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -268,25 +269,77 @@ func newNodeCmd() *cobra.Command {
 		Use:   "node",
 		Short: "Node management commands",
 	}
-	cmd.AddCommand(&cobra.Command{
-		Use:   "list",
-		Short: "List all configured nodes",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, _, err := loadConfig()
-			if err != nil {
-				return err
-			}
-			if cfg.OutputFormat == "json" || gFlags.outputFormat == "json" {
-				printJSON(cfg.Cluster.Nodes)
-			} else {
-				printHuman("%-16s %-32s %-6s %s", "ID", "HOST", "PORT", "AUTH_PROFILE")
-				for _, n := range cfg.Cluster.Nodes {
-					printHuman("%-16s %-32s %-6d %s", n.ID, n.Host, n.Port, n.AuthProfile)
+	cmd.AddCommand(
+		&cobra.Command{
+			Use:   "list",
+			Short: "List all configured nodes",
+			RunE: func(cmd *cobra.Command, args []string) error {
+				cfg, _, err := loadConfig()
+				if err != nil {
+					return err
 				}
-			}
-			return nil
+
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+
+				type nodeRow struct {
+					ID     string `json:"id"`
+					Host   string `json:"host"`
+					Port   int    `json:"port"`
+					Role   string `json:"role,omitempty"`
+					Status string `json:"status,omitempty"`
+					Auth   string `json:"auth_profile,omitempty"`
+				}
+
+				var rows []nodeRow
+
+				if pool, poolErr := connectControlDB(ctx, cfg.ControlDSN); poolErr == nil {
+					defer pool.Close()
+					dbRows, _ := pool.Query(ctx, `
+						SELECT id, host, port,
+						       COALESCE(role,'unknown'),
+						       COALESCE(status,'unknown')
+						FROM toris_control.nodes
+						WHERE cluster_id = $1
+						ORDER BY id
+					`, cfg.Cluster.ID)
+					if dbRows != nil {
+						defer dbRows.Close()
+						for dbRows.Next() {
+							var r nodeRow
+							_ = dbRows.Scan(&r.ID, &r.Host, &r.Port, &r.Role, &r.Status)
+							rows = append(rows, r)
+						}
+					}
+				}
+
+				if len(rows) == 0 {
+					for _, n := range cfg.Cluster.Nodes {
+						rows = append(rows, nodeRow{
+							ID:   n.ID,
+							Host: n.Host,
+							Port: n.Port,
+							Auth: n.AuthProfile,
+						})
+					}
+				}
+
+				if cfg.OutputFormat == "json" || gFlags.outputFormat == "json" {
+					printJSON(rows)
+				} else {
+					printHuman("%-16s %-32s %-6s %-10s %-10s %s",
+						"ID", "HOST", "PORT", "ROLE", "STATUS", "AUTH_PROFILE")
+					for _, r := range rows {
+						printHuman("%-16s %-32s %-6d %-10s %-10s %s",
+							r.ID, r.Host, r.Port, r.Role, r.Status, r.Auth)
+					}
+				}
+				return nil
+			},
 		},
-	})
+		newNodeAddCmd(),
+		newNodeRemoveCmd(),
+	)
 	return cmd
 }
 
@@ -474,7 +527,18 @@ func newBackupCmd() *cobra.Command {
 				return err
 			}
 			backupPath := args[0]
-			res, err := pgback.PgVerifyBackup(ctx, log, tools, backupPath, cfg.Timeouts.ToolExec)
+			verifyDir := backupPath
+			if info, statErr := os.Stat(backupPath); statErr == nil && info.IsDir() && hasTarArchives(backupPath) {
+				// pg_verifybackup on PG ≤17 only verifies plain-format backups,
+				// so extract the tar archives into a temp dir first.
+				var prepErr error
+				verifyDir, prepErr = backup.PrepareVerifyDir(ctx, backupPath)
+				if prepErr != nil {
+					return fmt.Errorf("preparing verification directory: %w", prepErr)
+				}
+				defer os.RemoveAll(verifyDir)
+			}
+			res, err := pgback.PgVerifyBackup(ctx, log, tools, verifyDir, cfg.Timeouts.ToolExec)
 			if err != nil {
 				return fmt.Errorf("verification failed: %w", err)
 			}
@@ -1021,54 +1085,62 @@ func newDoctorCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "doctor",
 		Short: "Diagnose common configuration and connectivity problems",
+		Long: `Runs a series of preflight checks and reports the results.
+
+Checks performed:
+  1. pg_* tools          — pg_isready, pg_basebackup, pg_verifybackup, pg_rewind, pg_ctl in PATH
+  2. Backup dir          — backup.base_dir exists and is writable
+  3. Control DSN         — control_dsn is configured
+  4. Control DB connect  — can connect and ping the control database
+  5. Control DB schema   — toris_control schema and required tables exist
+  6. Lease state         — shows active/expired/missing lease
+  7. Node freshness      — warns if any node has not been seen in >5 minutes
+  8. Backup freshness    — warns/fails if no verified backup within retention window
+
+Exit codes:
+  0 — all checks passed
+  3 — one or more checks failed`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, log, err := loadConfig()
 			if err != nil {
 				return fmt.Errorf("config problem: %w", err)
 			}
-			log.Info("doctor check starting")
 
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
+			adapter := &configDoctorAdapter{cfg: cfg}
+			results := RunDoctor(adapter, log)
 
-			fmt.Println("── toris doctor ─────────────────────────────")
+			jsonMode := cfg.OutputFormat == "json" || gFlags.outputFormat == "json"
+			allOK := PrintDoctorResults(results, jsonMode)
 
-			// Check 1: pg_* tools
-			fmt.Print("  pg_* tools      ... ")
-			_, toolErr := pgback.CheckTools(ctx)
-			printCheckResult(toolErr)
-
-			// Check 2: backup dir writable
-			fmt.Print("  backup dir      ... ")
-			f, err := os.CreateTemp(cfg.Backup.BaseDir, ".toris_doctor")
-			if err != nil {
-				printCheckResult(fmt.Errorf("cannot write to %s: %w", cfg.Backup.BaseDir, err))
-			} else {
-				f.Close()
-				os.Remove(f.Name())
-				printCheckResult(nil)
+			if !allOK {
+				os.Exit(3)
 			}
-
-			// Check 3: control DSN
-			fmt.Print("  control DSN     ... ")
-			if cfg.ControlDSN == "" {
-				printCheckResult(fmt.Errorf("control_dsn is not set"))
-			} else {
-				fmt.Println("✓ (configured; connection check requires daemon)")
-			}
-
-			fmt.Println("──────────────────────────────────────────────")
 			return nil
 		},
 	}
 }
 
-func printCheckResult(err error) {
-	if err != nil {
-		fmt.Printf("✗ %v\n", err)
-	} else {
-		fmt.Println("✓")
+// configDoctorAdapter wraps *config.Config to satisfy the RunDoctor interface.
+type configDoctorAdapter struct {
+	cfg *config.Config
+}
+
+func (a *configDoctorAdapter) GetControlDSN() string       { return a.cfg.ControlDSN }
+func (a *configDoctorAdapter) GetBackupBaseDir() string    { return a.cfg.Backup.BaseDir }
+func (a *configDoctorAdapter) GetClusterID() string        { return a.cfg.Cluster.ID }
+func (a *configDoctorAdapter) GetInstanceID() string       { return a.cfg.InstanceID }
+func (a *configDoctorAdapter) GetRetentionMaxAgeDays() int { return a.cfg.Backup.Retention.MaxAgeDays }
+func (a *configDoctorAdapter) GetRetentionMinCount() int   { return a.cfg.Backup.Retention.MinCount }
+func (a *configDoctorAdapter) GetLeaseTTL() time.Duration  { return a.cfg.Leader.LeaseTTL }
+func (a *configDoctorAdapter) GetRenewInterval() time.Duration {
+	return a.cfg.Leader.RenewInterval
+}
+func (a *configDoctorAdapter) GetNodes() []NodeInfo {
+	nodes := make([]NodeInfo, len(a.cfg.Cluster.Nodes))
+	for i, n := range a.cfg.Cluster.Nodes {
+		nodes[i] = NodeInfo{ID: n.ID}
 	}
+	return nodes
 }
 
 // ─── toris version ────────────────────────────────────────────────────────────
@@ -1125,6 +1197,24 @@ func formatBytes(b int64) string {
 }
 
 // ─── Shared CLI helpers ───────────────────────────────────────────────────────
+
+// hasTarArchives reports whether dir contains any .tar.gz artifacts (i.e. a
+// pg_basebackup -Ft staging directory rather than a plain-format backup tree).
+func hasTarArchives(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if strings.HasSuffix(entry.Name(), ".tar.gz") {
+			return true
+		}
+	}
+	return false
+}
 
 // connectControlDB opens a pgxpool connection to the toris control database.
 func connectControlDB(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
