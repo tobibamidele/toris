@@ -1,0 +1,133 @@
+@import 'tailwindcss';
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@font-face {
+  font-family: 'Geist Variable';
+  src: url('./fonts/Geist-Variable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Geist Mono Variable';
+  src: url('./fonts/GeistMono-Variable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@theme {
+  --font-sans: 'Geist Variable', ui-sans-serif, system-ui, -apple-system,
+    sans-serif;
+  --font-mono: 'Geist Mono Variable', ui-monospace, 'SF Mono', 'Cascadia Code',
+    monospace;
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    @apply bg-white text-black antialiased dark:bg-neutral-950 dark:text-white;
+    font-feature-settings: 'cv11' on, 'ss01' on;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    @apply bg-black text-white dark:bg-white dark:text-black;
+  }
+
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-black dark:outline-white;
+  }
+}
+
+@layer components {
+  .pressable {
+    @apply transition-transform duration-150 ease-out will-change-transform;
+  }
+  .pressable:active {
+    transform: scale(0.96);
+  }
+  .pressable[data-static] {
+    transform: none;
+  }
+}
+
+/* Pulsing ring glued to the leader on the globe */
+.globe-pulse {
+  pointer-events: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  border: 1.5px solid currentColor;
+  transform: translate(-50%, -50%) scale(0.4);
+  animation: globe-ping 2.6s cubic-bezier(0.2, 0, 0, 1) infinite;
+}
+
+@keyframes globe-ping {
+  0% {
+    transform: translate(-50%, -50%) scale(0.4);
+    opacity: 1;
+  }
+  70% {
+    opacity: 0.35;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(1.8);
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .globe-pulse {
+    animation: none;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+
+/* Hero entrance (staggered, runs once) */
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.rise-in {
+  animation: rise-in 0.7s cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rise-in {
+    animation: none;
+  }
+}
+
+/* Marquee for the pipeline strip */
+@keyframes ticker {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+.ticker {
+  animation: ticker 30s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ticker {
+    animation: none;
+  }
+}
